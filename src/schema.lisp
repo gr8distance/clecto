@@ -12,7 +12,24 @@
   (name         nil :type symbol)
   (table        nil :type string)
   (fields       nil :type list)    ; list of FIELD
+  (assocs       nil :type list)    ; list of ASSOC
   (primary-key  :id :type keyword))
+
+(defstruct association
+  (name        nil :type keyword)
+  (kind        nil :type keyword)   ; :has-many :has-one :belongs-to
+  (target      nil :type symbol)    ; target schema name
+  (foreign-key nil :type keyword))
+
+(defparameter *association-kinds* '(:has-many :has-one :belongs-to))
+
+(defun association-spec-p (spec)
+  (and (consp spec)
+       (consp (rest spec))
+       (member (second spec) *association-kinds*)))
+
+(defun schema-assoc (schema name)
+  (find name (schema-assocs schema) :key #'association-name))
 
 (defvar *schemas* (make-hash-table :test 'eq)
   "Global registry of schemas keyed by name symbol.")
@@ -34,25 +51,35 @@ e.g. (:email :string :required t)"
   (destructuring-bind (name type &rest options) spec
     (make-field :name name :type type :options options)))
 
-(defmacro defschema (name table &body field-specs)
-  "Define a schema:
+(defmacro defschema (name table &body specs)
+  "Define a schema. Each spec is either a field or an association:
 
   (defschema user \"users\"
-    (:id    :integer :primary-key t)
-    (:email :string  :required t)
-    (:age   :integer))
+    (:id    :integer :primary-key t)         ; field
+    (:email :string)                          ; field
+    (:posts :has-many post :foreign-key :user-id))   ; association
 
-NAME is a symbol (the schema id). TABLE is a SQL table name string."
-  (let ((fields (mapcar (lambda (s)
-                          `(make-field :name ,(first s)
-                                       :type ,(second s)
-                                       :options (list ,@(cddr s))))
-                        field-specs)))
+Supported association kinds: :has-many, :has-one, :belongs-to."
+  (let* ((field-specs (remove-if #'association-spec-p specs))
+         (assoc-specs (remove-if-not #'association-spec-p specs))
+         (fields (mapcar (lambda (s)
+                           `(make-field :name ,(first s)
+                                        :type ,(second s)
+                                        :options (list ,@(cddr s))))
+                         field-specs))
+         (assocs (mapcar (lambda (s)
+                           `(make-association
+                             :name ,(first s)
+                             :kind ,(second s)
+                             :target ',(third s)
+                             :foreign-key ,(getf (cdddr s) :foreign-key)))
+                         assoc-specs)))
     `(register-schema
       (make-schema
        :name ',name
        :table ,table
        :fields (list ,@fields)
+       :assocs (list ,@assocs)
        :primary-key
        (or ,(some (lambda (s)
                     (when (getf (cddr s) :primary-key)

@@ -16,7 +16,7 @@
   (sqlite:disconnect (sqlite-db adapter)))
 
 (defmethod adapter-quote-identifier ((a sqlite-adapter) name)
-  (format nil "\"~a\"" (string-downcase (string name))))
+  (format nil "\"~a\"" (sqlify-column name)))
 
 (defmethod adapter-placeholder ((a sqlite-adapter) index)
   (declare (ignore index))
@@ -34,9 +34,7 @@
            (loop for p in params for i from 1
                  do (sqlite:bind-parameter stmt i p))
            (let* ((names (sqlite:statement-column-names stmt))
-                  (keys (mapcar (lambda (n)
-                                  (alexandria:make-keyword (string-upcase n)))
-                                names)))
+                  (keys (mapcar #'lispify-column names)))
              (loop while (sqlite:step-statement stmt)
                    collect (loop for k in keys for i from 0
                                  append (list k (sqlite:statement-column-value stmt i))))))

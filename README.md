@@ -154,6 +154,40 @@ Where-expressions are S-expressions. Supported operators:
 Every builder returns a fresh `query` — composing two pipelines never
 mutates a shared object.
 
+### Associations — declared inline, preloaded explicitly
+
+Associations live in the same form as fields. If the second element of a spec
+is `:has-many`, `:has-one`, or `:belongs-to`, it's an association.
+
+```lisp
+(defschema user "users"
+  (:id    :integer :primary-key t)
+  (:email :string)
+  (:posts :has-many post :foreign-key :user-id)
+  (:bio   :has-one  bio  :foreign-key :user-id))
+
+(defschema post "posts"
+  (:id      :integer :primary-key t)
+  (:title   :string)
+  (:user-id :integer)
+  (:author  :belongs-to user :foreign-key :user-id))
+```
+
+Fetching is explicit — no lazy magic, no N+1 surprises. `repo-preload`
+runs one query per association regardless of how many records you give it:
+
+```lisp
+(let ((users (repo-all *repo* (from :users))))
+  (repo-preload *repo* 'user users :posts))
+;; => each user plist gains a :posts key
+
+(repo-preload *repo* 'user user '(:posts :bio))    ; multiple at once
+(repo-preload *repo* 'post posts :author)          ; belongs-to
+```
+
+Column-name translation between Lisp keywords (`:user-id`) and DB columns
+(`user_id`) is handled by the adapter — write idiomatic Lisp, get idiomatic SQL.
+
 ### Repo — the side-effect boundary
 
 ```lisp

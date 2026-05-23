@@ -18,10 +18,19 @@ PARAMS is a list of values in the order their placeholders appear."))
    "Execute SQL that mutates and return (values rows-affected last-insert-id).
 For RETURNING-style adapters this can be specialized to return rows instead."))
 
+(defun lispify-column (name)
+  "DB column name -> keyword: \"user_id\" -> :USER-ID."
+  (alexandria:make-keyword
+   (string-upcase (substitute #\- #\_ (string name)))))
+
+(defun sqlify-column (name)
+  "Keyword -> DB column name: :user-id -> \"user_id\"."
+  (substitute #\_ #\- (string-downcase (string name))))
+
 (defgeneric adapter-quote-identifier (adapter name)
   (:documentation "Quote a column/table identifier per the dialect.")
   (:method ((a adapter) name)
-    (format nil "\"~a\"" (string-downcase (string name)))))
+    (format nil "\"~a\"" (sqlify-column name))))
 
 (defgeneric adapter-placeholder (adapter index)
   (:documentation "Render the Nth (1-based) parameter placeholder.")

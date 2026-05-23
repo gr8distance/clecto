@@ -4,7 +4,11 @@
    ;; schema
    #:defschema #:schema #:find-schema
    #:schema-name #:schema-table #:schema-fields #:schema-primary-key
+   #:schema-assocs #:schema-assoc
    #:field-name #:field-type #:field-options
+   #:association
+   #:association-name #:association-kind
+   #:association-target #:association-foreign-key
    ;; changeset
    #:changeset #:make-changeset
    #:cs-data #:cs-changes #:cs-errors #:cs-valid-p #:cs-schema
@@ -28,4 +32,5 @@
    #:repo #:make-repo #:repo-adapter
    #:repo-all #:repo-one #:repo-get
    #:repo-insert #:repo-update #:repo-delete
+   #:repo-preload
    #:repo-execute))

@@ -120,3 +120,70 @@
            (repo-delete r 'int-user 2)
            (is (= 1 (length (repo-all r (from :users))))))
       (sqlite-close a))))
+
+;;; --- associations / preload ---
+
+(defschema assoc-user "users"
+  (:id    :integer :primary-key t)
+  (:email :string)
+  (:posts :has-many assoc-post :foreign-key :user-id)
+  (:bio   :has-one  assoc-bio  :foreign-key :user-id))
+
+(defschema assoc-post "posts"
+  (:id      :integer :primary-key t)
+  (:title   :string)
+  (:user-id :integer)
+  (:author  :belongs-to assoc-user :foreign-key :user-id))
+
+(defschema assoc-bio "bios"
+  (:id      :integer :primary-key t)
+  (:user-id :integer)
+  (:text    :string))
+
+(test schema-parses-associations
+  (let ((s (find-schema 'assoc-user)))
+    (is (= 2 (length (schema-assocs s))))
+    (let ((a (schema-assoc s :posts)))
+      (is (eq :has-many (association-kind a)))
+      (is (eq 'assoc-post (association-target a)))
+      (is (eq :user-id (association-foreign-key a))))))
+
+(test preload-roundtrip
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
+           (repo-execute r "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT, user_id INTEGER)")
+           (repo-execute r "CREATE TABLE bios  (id INTEGER PRIMARY KEY, user_id INTEGER, text TEXT)")
+           (repo-insert r (cast 'assoc-user '(:email "a@b") '(:email)))
+           (repo-insert r (cast 'assoc-user '(:email "c@d") '(:email)))
+           (dolist (p '((:title "p1" :user-id 1)
+                        (:title "p2" :user-id 1)
+                        (:title "p3" :user-id 2)))
+             (repo-insert r (cast 'assoc-post p '(:title :user-id))))
+           (repo-insert r (cast 'assoc-bio '(:user-id 1 :text "hi") '(:user-id :text)))
+           ;; has-many on list
+           (let* ((users (repo-all r (from :users)))
+                  (with-posts (repo-preload r 'assoc-user users :posts)))
+             (is (= 2 (length with-posts)))
+             (is (= 2 (length (getf (first with-posts) :posts))))
+             (is (= 1 (length (getf (second with-posts) :posts)))))
+           ;; has-one
+           (let ((with-bio (repo-preload r 'assoc-user
+                                         (repo-get r 'assoc-user 1)
+                                         :bio)))
+             (is (equal "hi" (getf (getf with-bio :bio) :text))))
+           ;; belongs-to
+           (let* ((posts (repo-all r (from :posts)))
+                  (with-author (repo-preload r 'assoc-post posts :author)))
+             (is (every (lambda (p) (getf p :author)) with-author))
+             (is (equal "a@b"
+                        (getf (getf (first with-author) :author) :email))))
+           ;; multiple at once
+           (let ((u (repo-preload r 'assoc-user
+                                  (repo-get r 'assoc-user 1)
+                                  '(:posts :bio))))
+             (is (= 2 (length (getf u :posts))))
+             (is (equal "hi" (getf (getf u :bio) :text)))))
+      (sqlite-close a))))
