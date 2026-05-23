@@ -18,19 +18,24 @@ PARAMS is a list of values in the order their placeholders appear."))
    "Execute SQL that mutates and return (values rows-affected last-insert-id).
 For RETURNING-style adapters this can be specialized to return rows instead."))
 
-(defvar *lispify-cache* (make-hash-table :test 'equal)
-  "String -> keyword cache so the same DB column name never re-interns.
-Bounds memory growth to the set of distinct column names actually emitted
-by the database (developer-controlled in practice).")
+(defvar *lispify-cache* (make-hash-table :test 'equal))
+(defvar *lispify-cache-lock* (bordeaux-threads:make-lock "clecto-lispify"))
+(defvar *lispify-cache-cap* 4096
+  "Maximum entries kept in *lispify-cache*. Past the cap we stop caching
+and just compute the keyword each time — bounded memory regardless of
+whatever distinct column aliases the DB emits.")
 
 (defun lispify-column (name)
-  "DB column name -> keyword: \"user_id\" -> :USER-ID. Cached to avoid
-unbounded keyword interning on hot query paths."
+  "DB column name -> keyword: \"user_id\" -> :USER-ID. Cached and bounded
+to keep keyword interning under control on hot query paths."
   (let ((s (string name)))
-    (or (gethash s *lispify-cache*)
-        (setf (gethash s *lispify-cache*)
-              (alexandria:make-keyword
-               (string-upcase (substitute #\- #\_ s)))))))
+    (bordeaux-threads:with-lock-held (*lispify-cache-lock*)
+      (or (gethash s *lispify-cache*)
+          (let ((kw (alexandria:make-keyword
+                     (string-upcase (substitute #\- #\_ s)))))
+            (when (< (hash-table-count *lispify-cache*) *lispify-cache-cap*)
+              (setf (gethash s *lispify-cache*) kw))
+            kw)))))
 
 (defun sqlify-column (name)
   "Keyword -> DB column name: :user-id -> \"user_id\"."
@@ -43,6 +48,21 @@ unbounded keyword interning on hot query paths."
     (if dot
         (values (subseq s 0 dot) (subseq s (1+ dot)))
         (values nil s))))
+
+(defun identifier-char-p (c)
+  (or (alphanumericp c) (char= c #\_)))
+
+(defun identifier-word-match-p (needle haystack)
+  "T iff NEEDLE appears in HAYSTACK with non-identifier chars (or string
+boundaries) on both sides. Lets us match \"email\" without also
+matching it inside \"customer_email\"."
+  (let ((pos (search needle haystack)))
+    (when pos
+      (and (or (zerop pos)
+               (not (identifier-char-p (char haystack (1- pos)))))
+           (let ((end (+ pos (length needle))))
+             (or (= end (length haystack))
+                 (not (identifier-char-p (char haystack end)))))))))
 
 (defun escape-identifier-body (s)
   "Escape the inside of a double-quoted SQL identifier: \"\"\"\" doubles the
@@ -95,6 +115,19 @@ this to choose between RETURNING and a last-insert-id roundtrip.")
   (:documentation
    "Signaled to abort a repo-transaction. The transaction body sees no
 condition; any returned value is discarded and the txn is rolled back."))
+
+(define-condition db-error (error)
+  ((original :initarg :original :reader db-error-original)
+   (sql      :initarg :sql      :initform nil :reader db-error-sql))
+  (:report (lambda (c stream)
+             (format stream "Database error.~@[ SQL: ~a~]"
+                     (db-error-sql c))))
+  (:documentation
+   "Generic wrapper raised when the underlying adapter signals a DB error
+that no declared constraint matched. The original condition is preserved
+under DB-ERROR-ORIGINAL — but its (potentially row-leaking) message is
+NOT printed by the default reporter, so it stays out of error pages and
+logs unless explicitly extracted."))
 
 (defgeneric adapter-translate-constraint-error (adapter condition constraints)
   (:documentation

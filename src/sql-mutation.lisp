@@ -54,10 +54,13 @@ that support it (Postgres) get a RETURNING clause appended."
       (t (error "Unknown :on-conflict mode: ~a" on-conflict)))))
 
 (defun excluded-set (adapter cols)
+  "Emit \"col\" = excluded.\"col\" pairs. Both sides are properly quoted
+so a hostile (or just weird) column name can't escape its quotes."
   (format nil "~{~a~^, ~}"
           (mapcar (lambda (c)
-                    (format nil "~a = excluded.~a"
-                            (qi adapter c) (sqlify-column c)))
+                    (format nil "~a = excluded.\"~a\""
+                            (qi adapter c)
+                            (escape-identifier-body (sqlify-column c))))
                   cols)))
 
 (defun insert-all-sql (adapter table rows)

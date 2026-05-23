@@ -11,7 +11,7 @@
    #:association
    #:association-name #:association-kind
    #:association-target #:association-foreign-key
-   #:now-naive-datetime #:generate-uuid)
+   #:now-naive-datetime #:generate-uuid #:generate-secure-token)
 
   ;; --- changeset ---
   (:export
@@ -43,15 +43,16 @@
   (:export
    #:adapter #:adapter-execute #:adapter-execute-returning
    #:adapter-quote-identifier #:adapter-placeholder
-   #:adapter-last-insert-id
+   #:adapter-last-insert-id #:adapter-supports-returning-p
    #:adapter-begin #:adapter-commit #:adapter-rollback
-   #:adapter-translate-constraint-error)
+   #:adapter-translate-constraint-error
+   #:db-error #:db-error-original #:db-error-sql)
 
   ;; --- sql ---
   (:export #:to-sql)
 
   ;; --- telemetry ---
-  (:export #:*telemetry*)
+  (:export #:*telemetry* #:*telemetry-include-params*)
 
   ;; --- adapters ---
   (:export

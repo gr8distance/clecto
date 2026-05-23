@@ -186,6 +186,87 @@
       (declare (ignore params))
       (is (search "RETURNING \"id\", \"email\"" sql)))))
 
+;;; --- v0.2 security/correctness hardening ---
+
+(test secure-uuid-uses-csprng
+  (let ((u (generate-uuid)))
+    (is (= 36 (length u)))
+    (is (char= #\4 (char u 14)))            ; version 4
+    (is (member (char u 19) '(#\8 #\9 #\a #\b))))  ; variant 1
+  (is (= 64 (length (generate-secure-token :byte-length 32)))))
+
+(test telemetry-omits-params-by-default
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a))
+         (events nil)
+         (clecto:*telemetry*
+           (lambda (event payload)
+             (push (list event (getf payload :params)) events))))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+           (repo-execute r "INSERT INTO t (n) VALUES (?)" '(42))
+           ;; Default: params NOT included
+           (is (every (lambda (e) (null (second e))) events))
+           ;; Opt in
+           (setf events nil)
+           (let ((clecto:*telemetry-include-params* t))
+             (repo-execute r "INSERT INTO t (n) VALUES (?)" '(99)))
+           (is (some (lambda (e) (equal '(99) (second e))) events)))
+      (sqlite-close a))))
+
+(test db-error-wraps-unmatched-constraint
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE cn_users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+           (repo-insert r (cast 'cn-user '(:email "a@b") '(:email)))
+           (handler-case
+               (repo-insert r (cast 'cn-user '(:email "a@b") '(:email)))
+             (clecto:db-error (e)
+               (is (not (null (clecto:db-error-original e))))
+               (is (search "Database error" (princ-to-string e)))
+               ;; The leaky row value is NOT in the default report
+               (is (not (search "a@b" (princ-to-string e)))))))
+      (sqlite-close a))))
+
+(test excluded-set-quotes-both-sides
+  (let ((a (make-instance 'mock-pg-adapter)))
+    (multiple-value-bind (sql params)
+        (clecto::insert-sql a :users '(:email "a@b")
+                            :on-conflict :replace :conflict-target :email)
+      (declare (ignore params))
+      (is (search "excluded.\"email\"" sql)))))
+
+(test repo-insert-all-caps-rows
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE cap (n INTEGER)")
+           (signals error
+             (let ((clecto::*repo-insert-all-row-cap* 3))
+               (repo-insert-all r 'cap-row (loop repeat 10 collect '(:n 1))))))
+      (sqlite-close a))))
+
+(defschema cap-row "cap" (:n :integer))
+
+(test prepare-row-strips-schema-meta
+  (let ((out (clecto::strip-cs-metadata '(:__schema__ user :a 1 :b 2))))
+    (is (equal nil (getf out :__schema__)))
+    (is (= 1 (getf out :a)))))
+
+(test sqlite-bool-sentinel-encodes-zero
+  (is (= 0 (clecto::sqlite-encode-param :false)))
+  (is (= 1 (clecto::sqlite-encode-param t)))
+  (is (null (clecto::sqlite-encode-param nil))))    ; nil still NULL
+
+(test pg-identifier-word-match
+  (is (clecto::identifier-word-match-p "email"  "Key (email)= already exists."))
+  (is (not (clecto::identifier-word-match-p
+            "email" "Key (customer_email)= already exists."))))
+
 ;;; --- security guards ---
 
 (test safe-number-parsing-rejects-reader-injection

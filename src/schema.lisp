@@ -109,16 +109,31 @@ Association kinds: :has-many :has-one :belongs-to"
   (multiple-value-bind (s m h d mo y) (decode-universal-time (get-universal-time))
     (format nil "~4,'0d-~2,'0d-~2,'0d ~2,'0d:~2,'0d:~2,'0d" y mo d h m s)))
 
+(defun read-secure-bytes (n)
+  "Read N bytes from the OS CSPRNG (/dev/urandom). Errors if the device
+isn't available — DO NOT silently fall back to PRNG since this function
+is used for security-sensitive UUIDs / tokens."
+  (with-open-file (s "/dev/urandom"
+                     :direction :input
+                     :element-type '(unsigned-byte 8)
+                     :if-does-not-exist :error)
+    (loop repeat n collect (read-byte s))))
+
 (defun generate-uuid ()
-  "RFC 4122 v4-ish UUID using SBCL's RNG. Not cryptographic-grade."
-  (flet ((rb () (random 256)))
-    (let ((b (loop repeat 16 collect (rb))))
-      ;; set version 4 and variant bits
-      (setf (nth 6 b) (logior #x40 (logand (nth 6 b) #x0f)))
-      (setf (nth 8 b) (logior #x80 (logand (nth 8 b) #x3f)))
-      (format nil "~{~2,'0x~}-~{~2,'0x~}-~{~2,'0x~}-~{~2,'0x~}-~{~2,'0x~}"
-              (subseq b 0 4) (subseq b 4 6) (subseq b 6 8)
-              (subseq b 8 10) (subseq b 10 16)))))
+  "RFC 4122 v4 UUID. Bytes come from the OS CSPRNG so the result is safe
+for session tokens, password-reset links, and other security-sensitive
+identifiers."
+  (let ((b (read-secure-bytes 16)))
+    (setf (nth 6 b) (logior #x40 (logand (nth 6 b) #x0f)))  ; version 4
+    (setf (nth 8 b) (logior #x80 (logand (nth 8 b) #x3f)))  ; variant 1
+    (format nil "~{~2,'0x~}-~{~2,'0x~}-~{~2,'0x~}-~{~2,'0x~}-~{~2,'0x~}"
+            (subseq b 0 4) (subseq b 4 6) (subseq b 6 8)
+            (subseq b 8 10) (subseq b 10 16))))
+
+(defun generate-secure-token (&key (byte-length 32))
+  "Random URL-safe-ish hex token from the OS CSPRNG. Default 32 bytes
+(256 bits). Use for session IDs, CSRF tokens, password-reset codes."
+  (format nil "~{~2,'0x~}" (read-secure-bytes byte-length)))
 
 (defun field-virtual-p (field)
   (getf (field-options field) :virtual))
@@ -207,8 +222,12 @@ Lisp reader. Accepts integers, decimals, and scientific notation. Returns
        (string (values value t))
        (t      (values (princ-to-string value) t))))
     ((eq type :boolean)
-     (cond ((member value '(t :true "true" "t" 1) :test #'equal) (values t t))
-           ((member value '(nil :false "false" "f" 0) :test #'equal) (values nil t))
+     (cond ((member value '(t :true "true" "t" 1) :test #'equal)
+            (values t t))
+           ;; NIL casts to the explicit :FALSE sentinel so adapters can
+           ;; distinguish "boolean false" from "value not provided".
+           ((member value '(nil :false "false" "f" 0) :test #'equal)
+            (values :false t))
            (t (values nil nil))))
     ((or (eq type :utc-datetime)
          (eq type :naive-datetime)

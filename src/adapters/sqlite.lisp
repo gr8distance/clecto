@@ -6,8 +6,13 @@
   ((db        :initarg :db   :reader sqlite-db)
    (path      :initarg :path :reader sqlite-path)
    (txn-depth :initform 0    :accessor sqlite-txn-depth)
-   (txn-lock  :initform (bordeaux-threads:make-lock "clecto-sqlite-txn")
-              :reader sqlite-txn-lock)))
+   (conn-lock :initform (bordeaux-threads:make-recursive-lock
+                         "clecto-sqlite-conn")
+              :reader sqlite-conn-lock
+              :documentation
+              "Recursive lock around every connection-touching method.
+Allows nested transactions on the same thread; serializes access from
+different threads so prepare/step/finalize don't interleave.")))
 
 (defun make-sqlite-adapter (path)
   "Open a SQLite database at PATH (\":memory:\" works)."
@@ -64,21 +69,22 @@
 
 (defmethod adapter-execute ((a sqlite-adapter) sql params)
   "Run SQL and return rows as plists keyed by lowercased-keyword column names."
-  (let* ((db (sqlite-db a))
-         (stmt (sqlite:prepare-statement db sql)))
-    (unwind-protect
-         (progn
-           (loop for p in params for i from 1
-                 do (sqlite:bind-parameter stmt i (sqlite-encode-param p)))
-           (let* ((names (sqlite:statement-column-names stmt))
-                  (keys (mapcar #'lispify-column names)))
-             (loop while (sqlite:step-statement stmt)
-                   collect (loop for k in keys for i from 0
-                                 append (list k (sqlite:statement-column-value stmt i))))))
-      (sqlite:finalize-statement stmt))))
+  (bordeaux-threads:with-recursive-lock-held ((sqlite-conn-lock a))
+    (let* ((db (sqlite-db a))
+           (stmt (sqlite:prepare-statement db sql)))
+      (unwind-protect
+           (progn
+             (loop for p in params for i from 1
+                   do (sqlite:bind-parameter stmt i (sqlite-encode-param p)))
+             (let* ((names (sqlite:statement-column-names stmt))
+                    (keys (mapcar #'lispify-column names)))
+               (loop while (sqlite:step-statement stmt)
+                     collect (loop for k in keys for i from 0
+                                   append (list k (sqlite:statement-column-value stmt i))))))
+        (sqlite:finalize-statement stmt)))))
 
 (defmethod adapter-begin ((a sqlite-adapter))
-  (bordeaux-threads:with-lock-held ((sqlite-txn-lock a))
+  (bordeaux-threads:with-recursive-lock-held ((sqlite-conn-lock a))
     (let ((d (sqlite-txn-depth a)))
       (if (zerop d)
           (sqlite:execute-non-query (sqlite-db a) "BEGIN")
@@ -87,7 +93,7 @@
       (incf (sqlite-txn-depth a)))))
 
 (defmethod adapter-commit ((a sqlite-adapter))
-  (bordeaux-threads:with-lock-held ((sqlite-txn-lock a))
+  (bordeaux-threads:with-recursive-lock-held ((sqlite-conn-lock a))
     (when (zerop (sqlite-txn-depth a))
       (error "adapter-commit: no open transaction"))
     (decf (sqlite-txn-depth a))
@@ -98,7 +104,7 @@
          (format nil "RELEASE SAVEPOINT sp_~a" (sqlite-txn-depth a))))))
 
 (defmethod adapter-rollback ((a sqlite-adapter))
-  (bordeaux-threads:with-lock-held ((sqlite-txn-lock a))
+  (bordeaux-threads:with-recursive-lock-held ((sqlite-conn-lock a))
     (when (zerop (sqlite-txn-depth a))
       (error "adapter-rollback: no open transaction"))
     (decf (sqlite-txn-depth a))
@@ -110,16 +116,21 @@
 
 (defmethod adapter-execute-returning ((a sqlite-adapter) sql params)
   "Execute a mutating statement. Returns (values changes last-insert-id)."
-  (apply #'sqlite:execute-non-query (sqlite-db a) sql
-         (mapcar #'sqlite-encode-param params))
-  (values (sqlite:execute-single (sqlite-db a) "SELECT changes()")
-          (sqlite:last-insert-rowid (sqlite-db a))))
+  (bordeaux-threads:with-recursive-lock-held ((sqlite-conn-lock a))
+    (apply #'sqlite:execute-non-query (sqlite-db a) sql
+           (mapcar #'sqlite-encode-param params))
+    (values (sqlite:execute-single (sqlite-db a) "SELECT changes()")
+            (sqlite:last-insert-rowid (sqlite-db a)))))
 
 (defun sqlite-encode-param (value)
-  "Coerce values SQLite can't natively bind: keywords, booleans, etc."
+  "Coerce values SQLite can't natively bind:
+  T       -> 1
+  :FALSE  -> 0  (explicit boolean false; NIL still becomes SQL NULL)
+  keyword -> downcased string (enum values, etc.)"
   (cond
-    ((eq value t)   1)
-    ((null value)   nil)
-    ((keywordp value) (string-downcase (symbol-name value)))
-    ((symbolp value)  (string-downcase (symbol-name value)))
+    ((eq value t)      1)
+    ((eq value :false) 0)
+    ((null value)      nil)        ; SQL NULL
+    ((keywordp value)  (string-downcase (symbol-name value)))
+    ((symbolp value)   (string-downcase (symbol-name value)))
     (t value)))

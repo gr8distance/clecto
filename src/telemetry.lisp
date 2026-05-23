@@ -16,10 +16,22 @@
 (defvar *telemetry* nil
   "Function (event payload) called around adapter-execute. NIL to disable.")
 
+(defvar *telemetry-include-params* nil
+  "Default NIL. Params often contain passwords, tokens, PII — they only
+appear in telemetry payloads when this is explicitly set to T.")
+
 (defun emit-event (event payload)
   (when *telemetry*
     (handler-case (funcall *telemetry* event payload)
       (error () nil))))    ; never let telemetry break the call site
+
+(defun build-payload (adapter sql params start &optional condition)
+  (let ((base (list :sql sql
+                    :params (when *telemetry-include-params* params)
+                    :duration (/ (- (get-internal-real-time) start)
+                                 internal-time-units-per-second)
+                    :adapter adapter)))
+    (if condition (append base (list :condition condition)) base)))
 
 (defmacro with-telemetry ((adapter sql params) &body body)
   "Wrap BODY (an adapter-execute call) with telemetry events."
@@ -29,17 +41,9 @@
     `(let ((,start (get-internal-real-time)))
        (handler-case
            (let ((,result (progn ,@body)))
-             (emit-event :query
-                         (list :sql ,sql :params ,params
-                               :duration (/ (- (get-internal-real-time) ,start)
-                                            internal-time-units-per-second)
-                               :adapter ,adapter))
+             (emit-event :query (build-payload ,adapter ,sql ,params ,start))
              ,result)
          (error (,cond-sym)
            (emit-event :error
-                       (list :sql ,sql :params ,params
-                             :duration (/ (- (get-internal-real-time) ,start)
-                                          internal-time-units-per-second)
-                             :adapter ,adapter
-                             :condition ,cond-sym))
+                       (build-payload ,adapter ,sql ,params ,start ,cond-sym))
            (error ,cond-sym))))))

@@ -91,13 +91,21 @@
       changes))
 
 (defun prepare-row (schema values action)
-  "Apply the persistence pipeline (timestamps -> drop virtuals -> encode embeds)
-for ACTION (:insert or :update). Returns a fresh plist ready for SQL."
+  "Apply the persistence pipeline (strip metadata -> timestamps ->
+drop virtuals -> encode embeds) for ACTION (:insert or :update).
+Returns a fresh plist ready for SQL."
   (encode-embeds schema
                  (drop-virtual schema
                                (ecase action
-                                 (:insert (stamp-insert schema values))
-                                 (:update (stamp-update schema values))))))
+                                 (:insert (stamp-insert schema
+                                          (strip-cs-metadata values)))
+                                 (:update (stamp-update schema
+                                          (strip-cs-metadata values)))))))
+
+(defun strip-cs-metadata (values)
+  "Drop changeset-side metadata (e.g. :__schema__) so it can't accidentally
+become a SQL column."
+  (alexandria:remove-from-plist values :__schema__))
 
 (defun query-where-expr (q)
   "Collapse a query's accumulated wheres into a single expression (or NIL)."
@@ -107,15 +115,18 @@ for ACTION (:insert or :update). Returns a fresh plist ready for SQL."
           (t (cons 'and ws)))))
 
 (defun catch-constraint-error (adapter cs thunk)
-  "Run THUNK. If it signals a DB error matching a constraint declared on CS,
-return (values nil cs-with-error). Otherwise propagate."
+  "Run THUNK. If it signals a DB error matching a constraint declared on
+CS, return (values nil cs-with-error). Otherwise wrap the original
+condition in CLECTO:DB-ERROR so the raw, possibly-row-leaking message
+isn't surfaced by default error handling."
   (handler-case (funcall thunk)
+    (clecto:db-error (e) (error e))   ; already wrapped — pass through
     (error (e)
       (multiple-value-bind (field message)
           (adapter-translate-constraint-error adapter e (cs-constraints cs))
         (if field
             (values nil (add-error cs field message))
-            (error e))))))
+            (error 'db-error :original e))))))
 
 (defun repo-insert (repo cs &key on-conflict conflict-target)
   "Insert from changeset. Returns (values record nil) on success or
@@ -143,14 +154,21 @@ ON-CONFLICT and CONFLICT-TARGET enable upsert; see INSERT-SQL."
                      (cond
                        (use-returning
                         ;; Adapter returns the inserted row (PG style).
+                        ;; If :on-conflict :nothing matched, RETURNING is
+                        ;; empty — treat as a benign no-op insert.
                         (or (first (adapter-execute adapter sql params))
+                            (when (eq on-conflict :nothing)
+                              (return-from repo-insert (values nil nil)))
                             (error "RETURNING produced no row")))
                        (t
-                        (adapter-execute-returning adapter sql params)
-                        (let* ((pk (schema-primary-key schema))
-                               (id (or (getf values pk)
-                                       (adapter-last-insert-id adapter))))
-                          (list* pk id values))))))
+                        ;; SQLite path: returning multi-values gives us
+                        ;; the last id atomically, no extra round-trip.
+                        (multiple-value-bind (changes last-id)
+                            (adapter-execute-returning adapter sql params)
+                          (declare (ignore changes))
+                          (let* ((pk (schema-primary-key schema))
+                                 (id (or (getf values pk) last-id)))
+                            (list* pk id values)))))))
                (values record nil))))))))
 
 (defun repo-update (repo cs)
@@ -171,10 +189,18 @@ ON-CONFLICT and CONFLICT-TARGET enable upsert; see INSERT-SQL."
              (adapter-execute-returning (repo-adapter repo) sql params)
              (values (apply-changes (copy-cs cs :changes changes)) nil)))))))
 
+(defvar *repo-insert-all-row-cap* 1000
+  "Maximum rows accepted by a single REPO-INSERT-ALL call. Keeps a single
+malformed call from exhausting memory or hitting Postgres' 65535-parameter
+limit. Callers with legitimately larger batches should chunk explicitly.")
+
 (defun repo-insert-all (repo schema-name rows)
   "Bulk insert ROWS (a list of plists). Auto-stamps timestamps when enabled.
-Returns the number of rows inserted."
+Returns the number of rows inserted. Caps at *repo-insert-all-row-cap*."
   (when rows
+    (when (> (length rows) *repo-insert-all-row-cap*)
+      (error "repo-insert-all: ~d rows exceeds cap of ~d. Chunk the input."
+             (length rows) *repo-insert-all-row-cap*))
     (let* ((schema (find-schema schema-name))
            (table  (intern-table schema))
            (stamped (mapcar (lambda (r) (stamp-insert schema r)) rows)))

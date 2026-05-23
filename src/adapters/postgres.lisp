@@ -9,13 +9,18 @@
 (defclass postgres-adapter (adapter)
   ((connection :initarg :connection :reader pg-connection)
    (txn-depth  :initform 0          :accessor pg-txn-depth)
-   (txn-lock   :initform (bordeaux-threads:make-lock "clecto-pg-txn")
-               :reader pg-txn-lock)))
+   (conn-lock  :initform (bordeaux-threads:make-recursive-lock
+                          "clecto-pg-conn")
+               :reader pg-conn-lock)))
 
 (defun make-postgres-adapter (database user password host
-                              &key (port 5432) (use-ssl :no) pooled-p)
+                              &key (port 5432) (use-ssl :try) pooled-p)
   "Connect to a Postgres database via postmodern. POOLED-P uses
-postmodern's connection pool keyed by connection spec."
+postmodern's connection pool keyed by connection spec.
+
+USE-SSL defaults to :TRY (use TLS if the server supports it, otherwise
+plaintext). Pass :YES to require TLS or :NO to opt out — never opt out
+for connections that traverse anything but a Unix socket."
   (make-instance 'postgres-adapter
                  :connection (postmodern:connect database user password host
                                                  :port port
@@ -39,12 +44,17 @@ postmodern's connection pool keyed by connection spec."
           (format nil "\"~a\"" (escape-identifier-body c)))))
 
 (defun postgres-encode-param (value)
-  "Coerce values postmodern can't bind directly: keywords -> strings."
+  "Coerce values for cl-postgres bind:
+  T       -> \"t\"   (boolean true in text protocol)
+  :FALSE  -> \"f\"   (boolean false; distinguishes from NIL/NULL)
+  NIL     -> :null   (cl-postgres sentinel for SQL NULL)
+  keyword -> downcased name string"
   (cond
-    ((eq value t)     "t")
-    ((null value)     :null)
-    ((keywordp value) (string-downcase (symbol-name value)))
-    ((symbolp value)  (string-downcase (symbol-name value)))
+    ((eq value t)      "t")
+    ((eq value :false) "f")
+    ((null value)      :null)
+    ((keywordp value)  (string-downcase (symbol-name value)))
+    ((symbolp value)   (string-downcase (symbol-name value)))
     (t value)))
 
 (defun pg-row-to-plist (alist)
@@ -52,29 +62,31 @@ postmodern's connection pool keyed by connection spec."
         append (list (lispify-column (string k)) v)))
 
 (defmethod adapter-execute ((a postgres-adapter) sql params)
-  (let ((conn (pg-connection a))
-        (encoded (mapcar #'postgres-encode-param params)))
-    (mapcar #'pg-row-to-plist
-            (if encoded
-                (cl-postgres:exec-prepared
-                 conn
-                 (cl-postgres:prepare-query conn "" sql)
-                 encoded
-                 'cl-postgres:alist-row-reader)
-                (cl-postgres:exec-query
-                 conn sql 'cl-postgres:alist-row-reader)))))
+  (bordeaux-threads:with-recursive-lock-held ((pg-conn-lock a))
+    (let ((conn (pg-connection a))
+          (encoded (mapcar #'postgres-encode-param params)))
+      (mapcar #'pg-row-to-plist
+              (if encoded
+                  (cl-postgres:exec-prepared
+                   conn
+                   (cl-postgres:prepare-query conn "" sql)
+                   encoded
+                   'cl-postgres:alist-row-reader)
+                  (cl-postgres:exec-query
+                   conn sql 'cl-postgres:alist-row-reader))))))
 
 (defmethod adapter-execute-returning ((a postgres-adapter) sql params)
   "PG: execute and return the count of affected rows. No useful last-id
 because every PG insert that needs one uses RETURNING via the repo path."
-  (let ((conn (pg-connection a))
-        (encoded (mapcar #'postgres-encode-param params)))
-    (if encoded
-        (cl-postgres:exec-prepared
-         conn (cl-postgres:prepare-query conn "" sql) encoded
-         'cl-postgres:ignore-row-reader)
-        (cl-postgres:exec-query
-         conn sql 'cl-postgres:ignore-row-reader))))
+  (bordeaux-threads:with-recursive-lock-held ((pg-conn-lock a))
+    (let ((conn (pg-connection a))
+          (encoded (mapcar #'postgres-encode-param params)))
+      (if encoded
+          (cl-postgres:exec-prepared
+           conn (cl-postgres:prepare-query conn "" sql) encoded
+           'cl-postgres:ignore-row-reader)
+          (cl-postgres:exec-query
+           conn sql 'cl-postgres:ignore-row-reader)))))
 
 (defmethod adapter-last-insert-id ((a postgres-adapter))
   (declare (ignore a))
@@ -83,7 +95,7 @@ because every PG insert that needs one uses RETURNING via the repo path."
 ;;; --- transactions ---
 
 (defmethod adapter-begin ((a postgres-adapter))
-  (bordeaux-threads:with-lock-held ((pg-txn-lock a))
+  (bordeaux-threads:with-recursive-lock-held ((pg-conn-lock a))
     (let ((d (pg-txn-depth a)))
       (if (zerop d)
           (cl-postgres:exec-query (pg-connection a) "BEGIN"
@@ -94,7 +106,7 @@ because every PG insert that needs one uses RETURNING via the repo path."
       (incf (pg-txn-depth a)))))
 
 (defmethod adapter-commit ((a postgres-adapter))
-  (bordeaux-threads:with-lock-held ((pg-txn-lock a))
+  (bordeaux-threads:with-recursive-lock-held ((pg-conn-lock a))
     (when (zerop (pg-txn-depth a))
       (error "adapter-commit: no open transaction"))
     (decf (pg-txn-depth a))
@@ -107,7 +119,7 @@ because every PG insert that needs one uses RETURNING via the repo path."
          'cl-postgres:ignore-row-reader))))
 
 (defmethod adapter-rollback ((a postgres-adapter))
-  (bordeaux-threads:with-lock-held ((pg-txn-lock a))
+  (bordeaux-threads:with-recursive-lock-held ((pg-conn-lock a))
     (when (zerop (pg-txn-depth a))
       (error "adapter-rollback: no open transaction"))
     (decf (pg-txn-depth a))
@@ -139,21 +151,34 @@ because every PG insert that needs one uses RETURNING via the repo path."
      (find-constraint-match constraints :check c))
     (t nil)))
 
+(defun extract-quoted-name (msg)
+  "Return the first double-quoted identifier in MSG, or NIL.
+PG always wraps constraint names in double quotes, so we can pull the
+exact name out instead of doing a fuzzy substring match that could
+accidentally hit a similarly-named constraint."
+  (when msg
+    (let ((open (position #\" msg)))
+      (when open
+        (let ((close (position #\" msg :start (1+ open))))
+          (when close (subseq msg (1+ open) close)))))))
+
 (defun find-constraint-match (constraints kind condition)
   "Find a matching CONSTRAINT and return (values field message).
-PG error messages quote the constraint name (e.g. \"users_email_key\");
-we match by explicit :name first, then fall back to column-substring match."
+Strategy (most specific first):
+  1. :name equals the quoted constraint name from the PG error
+  2. :column appears as a whole identifier in the message"
   (let* ((msg (and condition (princ-to-string condition)))
+         (quoted (extract-quoted-name msg))
          (hit (find-if (lambda (k)
                          (and (eq (constraint-kind k) kind)
-                              (or
-                               ;; explicit :name match (preferred)
-                               (and (constraint-name k) msg
-                                    (search (constraint-name k) msg))
-                               ;; column-substring fallback
-                               (and (constraint-column k) msg
-                                    (search (string-downcase
-                                             (string (constraint-column k)))
-                                            msg)))))
+                              (or (and (constraint-name k) quoted
+                                       (string= (constraint-name k) quoted))
+                                  (and (constraint-column k) msg
+                                       (identifier-word-match-p
+                                        (string-downcase
+                                         (sqlify-column (constraint-column k)))
+                                        msg)))))
                        constraints)))
     (when hit (values (constraint-field hit) (constraint-message hit)))))
+
+;; identifier-word-match-p and identifier-char-p live in adapter.lisp now.
