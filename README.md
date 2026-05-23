@@ -17,10 +17,14 @@ something the size of Phoenix, without any of the magic.
 |---|---|
 | **schema**     | `defschema` registers field metadata as plain data. No CLOS instances. |
 | **changeset**  | `(cast → validate-* → validate-*)` — an immutable value flows through the pipeline. |
-| **query**      | `(from → where → order-by → limit)` — builds a data AST. |
-| **sql**        | Pure AST → SQL compiler. Dialect specifics live in the adapter. |
-| **adapter**    | Generic-function protocol (`adapter-execute`, `-quote-identifier`, ...). |
+| **query**      | `(from → where → join → group-by → having → ...)` — builds a data AST. |
+| **sql**        | Pure AST → SQL compiler. Split into `sql-expr`, `sql-select`, `sql-mutation`. |
+| **adapter**    | Generic-function protocol — SQLite ships with the core; Postgres lives in `clecto/postgres`. |
 | **repo**       | The side-effect boundary. The *only* place that hits the DB. |
+| **telemetry**  | A single `*telemetry*` callable invoked around every query. |
+
+143 tests pass against SQLite. The Postgres adapter compiles cleanly and
+emits the right SQL; integration tests against a live PG live with your app.
 
 ---
 
@@ -36,19 +40,21 @@ ln -s ~/src/clecto ~/quicklisp/local-projects/clecto
 Then in a REPL:
 
 ```lisp
-(ql:quickload :clecto)
+(ql:quickload :clecto)             ; core + SQLite adapter
+(ql:quickload :clecto/postgres)    ; optional: Postgres adapter
 ```
 
-You'll also need `cl-sqlite` (pulled in automatically) and a SQLite library on
-your system. v0.1 ships a SQLite adapter only; Postgres/MySQL fit the same
-protocol and will land later.
+You'll also need a SQLite library on your system if you use the default
+adapter. The Postgres adapter pulls `postmodern`.
 
 ---
 
 ## Quickstart
 
 ```lisp
-(defpackage #:demo (:use #:cl #:clecto))
+(defpackage #:demo
+  (:use #:cl #:clecto)
+  (:shadowing-import-from #:clecto #:union #:intersection #:set-difference))
 (in-package #:demo)
 
 (defmacro -> (init &body forms)
@@ -59,22 +65,24 @@ protocol and will land later.
 (defschema user "users"
   (:id    :integer :primary-key t)
   (:email :string)
-  (:age   :integer))
+  (:age   :integer)
+  (:timestamps))
 
 (defparameter *repo* (make-repo (make-sqlite-adapter ":memory:")))
 
 (repo-execute *repo*
-  "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, age INTEGER)")
+  "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, age INTEGER,
+                       inserted_at TEXT, updated_at TEXT)")
 
-;; A changeset is just a value that flows through validators.
 (defun new-user (attrs)
   (-> (cast 'user attrs '(:email :age))
       (validate-required '(:email))
       (validate-format   :email "@")
-      (validate-number   :age :>= 0)))
+      (validate-number   :age :>= 0)
+      (unique-constraint :email)))
 
 (repo-insert *repo* (new-user '(:email "a@b" :age 20)))
-;; => (:ID 1 :EMAIL "a@b" :AGE 20), NIL
+;; => (:ID 1 :EMAIL "a@b" :AGE 20 :INSERTED-AT "..." :UPDATED-AT "..."), NIL
 
 (repo-insert *repo* (new-user '(:email "bad" :age -1)))
 ;; => NIL, #<CHANGESET ... :errors ((AGE . "is out of range") ...)>
@@ -82,55 +90,84 @@ protocol and will land later.
 
 ---
 
-## Concepts
-
-### Schema — declarative shape
+## Schema
 
 ```lisp
 (defschema user "users"
-  (:id          :integer      :primary-key t)
-  (:email       :string)
-  (:age         :integer)
-  (:inserted-at :utc-datetime))
+  (:id       :integer :primary-key t)
+  (:email    :string)
+  (:age      :integer)
+  (:status   :enum :values '(:draft :published))
+  (:password :string :virtual t)             ; never persisted
+  (:address  :embeds-one  address)           ; stored as JSON
+  (:tags     :embeds-many tag)               ; JSON array
+  (:posts    :has-many post :foreign-key :user-id)
+  (:bio      :has-one  bio  :foreign-key :user-id)
+  (:timestamps))                              ; auto inserted-at/updated-at
 ```
 
-A schema is a name + table + list of `field` records. It's stored in a
-registry by name and looked up with `find-schema`. No methods, no instances —
-just a description of the shape.
+**Field types**:
+`:integer`, `:float`, `:decimal`, `:string`, `:boolean`,
+`:utc-datetime`, `:naive-datetime`, `:date`, `:binary-id`,
+`:enum` (with `:values '(...)`)
 
-Supported types: `:integer`, `:float`, `:string`, `:boolean`, `:utc-datetime`.
+**Field options**:
+`:primary-key`, `:virtual t` (skipped at insert/update), `:required`, …
 
-### Changeset — validation as a pipeline
+**Association kinds**:
+`:has-many`, `:has-one`, `:belongs-to`, `:embeds-one`, `:embeds-many`
 
-A changeset carries:
+**Timestamps**: writing `(:timestamps)` injects `:inserted-at` and
+`:updated-at` (`:naive-datetime`) fields and auto-populates them.
 
-- `data`     — the existing record (`nil` on insert)
-- `changes`  — proposed updates
-- `errors`   — `(field . message)` pairs
-- `valid-p`  — derived flag
-- `schema`   — the schema name, for type casting
+---
 
-Every operation returns a fresh changeset:
+## Changeset
 
 ```lisp
-(-> (cast 'user '(:email "a@b" :age "20") '(:email :age))
+(-> (cast 'user attrs '(:email :age :password))
     (validate-required '(:email))
-    (validate-format   :email "@")
-    (validate-length   :email :min 3 :max 80)
-    (validate-number   :age :>= 0 :<= 150))
+    (validate-format     :email "@")
+    (validate-length     :email :min 3 :max 80)
+    (validate-number     :age :>= 0 :<= 150)
+    (validate-inclusion  :status '(:draft :published))
+    (validate-exclusion  :email '("admin@example.com"))
+    (validate-confirmation :password)             ; checks :password-confirmation
+    (validate-acceptance :terms)
+    (unique-constraint :email :message "taken")
+    (foreign-key-constraint :role-id)
+    (check-constraint  :age :name "users_age_positive"))
 ```
 
-`cast` filters the incoming attrs by the allowed list and runs type coercion
-against the schema (`"20"` → `20`). If a value fails to cast, it shows up in
-`cs-errors` and `valid-p` flips to `nil`.
-
-You can also stash intermediate values:
+A changeset carries `data`, `changes`, `errors`, `valid-p`, `constraints`,
+`action`. Every operation returns a fresh one. The full constructor and
+helper API:
 
 ```lisp
-(put-change cs :hashed-password (hash (get-change cs :password)))
+(cast data-or-schema attrs allowed-fields)   ; produces a changeset
+(put-change cs field value)                  ; force a change
+(get-change cs field)                        ; only in proposed changes
+(get-field  cs field)                        ; change overrides data
+(add-error  cs field message)
+(apply-changes cs)                            ; merge changes onto data
+
+;; Nested forms / embedded data
+(cast-embed cs :address attrs #'address-changeset)   ; one or many
+(cast-assoc cs :posts   attrs #'post-changeset)
+
+;; LiveView form pattern: validate without hitting DB
+(apply-action cs :insert)
+;; => (values data nil)  if valid
+;; => (values nil cs-with-action) otherwise
+
+;; Render errors in templates
+(traverse-errors cs (lambda (field msg) (format nil "[~a] ~a" field msg)))
+;; => ((:email "[email] can't be blank") (:age "[age] is out of range"))
 ```
 
-### Query — composable AST
+---
+
+## Query
 
 ```lisp
 (-> (from :users)
@@ -141,88 +178,80 @@ You can also stash intermediate values:
     (limit 10))
 ```
 
-Where-expressions are S-expressions. Supported operators:
-
+**Where operators**:
 ```
 (= COL V)   (<> COL V)   (< COL V)   (<= COL V)   (> COL V)   (>= COL V)
-(in COL (V1 V2 ...))
+(in COL (V1 V2 ...))     (in COL subquery)
 (like COL "pat%")
 (is-null COL)   (is-not-null COL)
-(and EXPR EXPR ...)   (or EXPR EXPR ...)   (not EXPR)
+(and EXPR ...)  (or EXPR ...)  (not EXPR)
 (:fragment "raw sql with ? holes" arg1 arg2 ...)
 ```
 
-Aggregates work in `select` and `having`:
-
+**Aggregates** (in `select` / `having`):
 ```
 (:count :id)   (:count :*)   (:sum :age)   (:avg :age)   (:min ...)   (:max ...)
 ```
 
-### Joins, group-by, having
-
-Qualified column names use a dotted keyword (`:users.id`).
-
+**Joins, group-by, having** — qualified columns are dotted keywords:
 ```lisp
 (-> (from :users)
     (join :inner :posts '(= :users.id :posts.user-id))
-    (where '(= :users.email "a@b"))
     (group-by :users.id)
     (having '(> (:count :posts.id) 3))
     (select '(:users.id (:count :posts.id))))
 ```
 
-Supported join kinds: `:inner`, `:left`, `:right`, `:full`
-(dialect-dependent).
+Join kinds: `:inner`, `:left`, `:right`, `:full` (dialect-dependent).
 
-### Fragment — raw SQL escape hatch
+**Distinct** (incl. Postgres DISTINCT ON):
+```lisp
+(distinct (from :users))            ; SELECT DISTINCT *
+(distinct (from :users) :role)       ; DISTINCT ON (role)
+```
 
-When the DSL doesn't reach, drop down to SQL:
+**Subqueries and CTEs**:
+```lisp
+(let ((inner (select (from :users) '(:id))))
+  (where (from :posts) (list 'in :user-id (subquery inner))))
 
+(-> (from :user-counts)
+    (with-cte :user-counts (from :users)))
+```
+
+**Set operations** (shadowing `cl:union` & friends):
+```lisp
+(clecto:union     q1 q2)
+(union-all        q1 q2)
+(intersect        q1 q2)
+(except           q1 q2)
+```
+
+**Locking + multi-tenant prefix**:
+```lisp
+(lock        (from :users) :for-update)
+(with-prefix (from :users) "tenant_a")
+```
+
+**Composable dynamic filters**:
+```lisp
+(-> (from :users)
+    (where-if min-age `(>= :age ,min-age))   ; nil condition → no-op
+    (where-if role    `(= :role ,role))
+    (where (and-filters '(>= :age 18) (when verified? '(= :verified t)))))
+```
+
+**Fragment** — when the DSL doesn't reach, embed raw SQL safely:
 ```lisp
 (where q '(:fragment "lower(?) = ?" :email "abc@example.com"))
 (select q '((:fragment "coalesce(?, 0)" :score)))
 ```
+Keyword args become inlined (escaped) identifiers; everything else is a
+parameter.
 
-Keyword args become inlined identifiers; everything else is parameterized.
+---
 
-Every builder returns a fresh `query` — composing two pipelines never
-mutates a shared object.
-
-### Associations — declared inline, preloaded explicitly
-
-Associations live in the same form as fields. If the second element of a spec
-is `:has-many`, `:has-one`, or `:belongs-to`, it's an association.
-
-```lisp
-(defschema user "users"
-  (:id    :integer :primary-key t)
-  (:email :string)
-  (:posts :has-many post :foreign-key :user-id)
-  (:bio   :has-one  bio  :foreign-key :user-id))
-
-(defschema post "posts"
-  (:id      :integer :primary-key t)
-  (:title   :string)
-  (:user-id :integer)
-  (:author  :belongs-to user :foreign-key :user-id))
-```
-
-Fetching is explicit — no lazy magic, no N+1 surprises. `repo-preload`
-runs one query per association regardless of how many records you give it:
-
-```lisp
-(let ((users (repo-all *repo* (from :users))))
-  (repo-preload *repo* 'user users :posts))
-;; => each user plist gains a :posts key
-
-(repo-preload *repo* 'user user '(:posts :bio))    ; multiple at once
-(repo-preload *repo* 'post posts :author)          ; belongs-to
-```
-
-Column-name translation between Lisp keywords (`:user-id`) and DB columns
-(`user_id`) is handled by the adapter — write idiomatic Lisp, get idiomatic SQL.
-
-### Repo — the side-effect boundary
+## Repo
 
 ```lisp
 (defparameter *repo* (make-repo (make-sqlite-adapter "app.db")))
@@ -249,69 +278,85 @@ Column-name translation between Lisp keywords (`:user-id`) and DB columns
 (repo-insert *repo* cs :on-conflict :nothing)
 (repo-insert *repo* cs :on-conflict '(:replace :age :updated-at))
 
+;; preload associations
+(repo-preload *repo* 'user users :posts)
+(repo-preload *repo* 'user user '(:posts :bio))
+(repo-preload *repo* 'post posts :author)
+
 ;; raw SQL escape hatch
 (repo-execute *repo* "VACUUM")
 ```
 
-`repo-insert` / `repo-update` return `(values record nil)` on success and
-`(values nil invalid-changeset)` on validation or constraint failure.
-
-### Transactions
-
+**Transactions** (nested = automatic savepoints):
 ```lisp
 (repo-transaction (*repo*)
   (repo-insert *repo* cs1)
-  (repo-insert *repo* cs2))
-
-;; Abort cleanly from anywhere inside:
-(repo-transaction (*repo*)
-  (when (something-bad) (rollback))
-  ...)
+  (repo-insert *repo* cs2)
+  (repo-transaction (*repo*)              ; nested = savepoint
+    (when oops? (rollback))               ; cleanly aborts the savepoint
+    ...))
 ```
+Any unhandled error rolls back the (sub)transaction; `rollback` aborts
+without an error.
 
-Nesting uses savepoints automatically. Any unhandled error inside the body
-rolls back the (sub)transaction.
+---
 
-### Constraint errors as changeset errors
-
-Declare which DB constraint should land on which field, then let the repo
-translate failures:
+## Adapters
 
 ```lisp
-(-> (cast 'user attrs '(:email))
-    (validate-required '(:email))
-    (unique-constraint :email :message "already taken")
-    (foreign-key-constraint :role-id))
-
-;; If insert fails with UNIQUE/FOREIGN KEY, you get back the changeset
-;; with the right error attached — no exception escapes.
+(defgeneric adapter-execute              (a sql params))
+(defgeneric adapter-execute-returning    (a sql params))
+(defgeneric adapter-quote-identifier     (a name))
+(defgeneric adapter-placeholder          (a index))
+(defgeneric adapter-last-insert-id       (a))
+(defgeneric adapter-supports-returning-p (a))
+(defgeneric adapter-begin    (a))
+(defgeneric adapter-commit   (a))
+(defgeneric adapter-rollback (a))
+(defgeneric adapter-translate-constraint-error (a condition constraints))
 ```
 
-### Timestamps
-
-Opt in by adding `(:timestamps)` to the schema body. `:inserted-at` and
-`:updated-at` (type `:naive-datetime`) are added to the field list and
-auto-populated on insert/update.
+Two adapters ship today:
 
 ```lisp
-(defschema user "users"
-  (:id    :integer :primary-key t)
-  (:email :string)
-  (:timestamps))
+(make-sqlite-adapter ":memory:")
+(make-sqlite-adapter "/var/app.db")
+
+(make-postgres-adapter "mydb" "user" "secret" "localhost"
+                       :port 5432 :pooled-p t)
 ```
 
-### Adapter — the dialect protocol
+The Postgres adapter is in the optional `clecto/postgres` system — it
+pulls `postmodern`. When the adapter signals
+`adapter-supports-returning-p`, `repo-insert` will use `RETURNING` to
+recover the inserted PK in one round-trip instead of `last_insert_id`.
+
+> **Thread safety**: the SQLite/PG adapters lock their internal
+> transaction depth with `bordeaux-threads`. For Clack workers the
+> standard practice is one connection per worker thread — sharing one
+> adapter across threads works for short reads but a long-running
+> transaction will block.
+
+---
+
+## Telemetry
+
+A single hook around every executed query:
 
 ```lisp
-(defgeneric adapter-execute           (a sql params))
-(defgeneric adapter-execute-returning (a sql params))
-(defgeneric adapter-quote-identifier  (a name))
-(defgeneric adapter-placeholder       (a index))
-(defgeneric adapter-last-insert-id    (a))
+(setf clecto:*telemetry*
+      (lambda (event payload)
+        (case event
+          (:query (log:info "sql=~a duration=~,3fs" (getf payload :sql)
+                                                      (getf payload :duration)))
+          (:error (log:error "boom: ~a / ~a"
+                             (getf payload :sql)
+                             (getf payload :condition))))))
 ```
 
-That's the whole protocol. Adding Postgres or MySQL is one file in
-`src/adapters/`.
+Payload keys: `:sql`, `:params`, `:duration`, `:adapter`, plus
+`:condition` on `:error`. Callback errors are swallowed so telemetry
+never breaks a query.
 
 ---
 
@@ -319,18 +364,22 @@ That's the whole protocol. Adding Postgres or MySQL is one file in
 
 ```
 src/
-  package.lisp         ; exports
-  schema.lisp          ; defschema, field, cast-value
-  changeset.lisp       ; cast, validate-*, put-change, apply-changes
-  query.lisp           ; from / where / select / order-by / limit
-  sql.lisp             ; pure AST -> SQL compiler
-  adapter.lisp         ; the generic-function protocol
+  package.lisp         ; subsystem-grouped (:export ...) blocks
+  util.lisp            ; define-copier macro
+  schema.lisp          ; defschema, field, association, cast-value
+  changeset.lisp       ; cast, validate-*, constraints, traverse-errors
+  query.lisp           ; from / where / join / etc. + subquery + cte
+  adapter.lisp         ; generic-function protocol + identifier escaping
+  telemetry.lisp       ; *telemetry* hook + with-telemetry macro
+  sql.lisp             ; facade: sql-state, qi, emit-param
+  sql-expr.lisp        ; operators, aggregates, fragment, operands
+  sql-select.lisp      ; emit-select, joins, distinct, CTE, set ops, lock
+  sql-mutation.lisp    ; INSERT (incl. RETURNING + ON CONFLICT), UPDATE, DELETE
   adapters/
-    sqlite.lisp        ; v0.1 ships this one
-  repo.lisp            ; the only side-effecting module
+    sqlite.lisp        ; default
+    postgres.lisp      ; clecto/postgres system
+  repo.lisp            ; the side-effect boundary
 ```
-
-Each file is small and orthogonal — take what you need, ignore the rest.
 
 ---
 
@@ -342,18 +391,12 @@ sbcl --non-interactive --load ~/quicklisp/setup.lisp \
      --eval '(asdf:test-system :clecto)'
 ```
 
-27 checks, including a SQLite roundtrip (insert → select → update → delete).
-
----
-
-## Roadmap
-
-- v0.1 (this release): schema, changeset, query, sql, sqlite adapter, repo
-- Postgres adapter via `postmodern`
-- Associations (`belongs-to`, `has-many`) with explicit preload
-- Migrations DSL
-- Transactions (`repo-transaction`)
-- MySQL adapter
+143 tests covering schema, changeset, query AST, SQL emission, SQLite
+roundtrips (insert / select / update / delete / transactions /
+constraints / preload / upsert / bulk / embeds), Postgres SQL emission
+via a mock adapter, telemetry, and security guards (read-from-string
+rejection, identifier escaping, LIMIT/OFFSET coercion, ORDER BY and
+lock whitelists).
 
 ---
 
