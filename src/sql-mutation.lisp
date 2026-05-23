@@ -12,20 +12,20 @@
 CONFLICT-TARGET is a column keyword or list of keywords (defaults to PK column).
 RETURNING is a column keyword, list of keywords, or T (for *) — adapters
 that support it (Postgres) get a RETURNING clause appended."
-  (let* ((st (make-sql-state :adapter adapter))
-         (cols (loop for (k v) on values-plist by #'cddr collect k))
-         (vals (loop for (k v) on values-plist by #'cddr collect v))
-         (placeholders (mapcar (lambda (v) (emit-param st v)) vals))
-         (conflict-sql (when on-conflict
-                         (render-conflict adapter on-conflict conflict-target cols)))
-         (returning-sql (when returning (render-returning adapter returning)))
-         (sql (format nil "INSERT INTO ~a (~{~a~^, ~}) VALUES (~{~a~^, ~})~@[~a~]~@[~a~]"
-                      (qi adapter table)
-                      (mapcar (lambda (c) (qi adapter c)) cols)
-                      placeholders
-                      conflict-sql
-                      returning-sql)))
-    (values sql (nreverse (sql-state-params st)))))
+  (let ((st (make-sql-state :adapter adapter)))
+    (multiple-value-bind (cols vals) (plist-split values-plist)
+      (let* ((placeholders (mapcar (lambda (v) (emit-param st v)) vals))
+             (conflict-sql (when on-conflict
+                             (render-conflict adapter on-conflict
+                                              conflict-target cols)))
+             (returning-sql (when returning (render-returning adapter returning)))
+             (sql (format nil "INSERT INTO ~a (~{~a~^, ~}) VALUES (~{~a~^, ~})~@[~a~]~@[~a~]"
+                          (qi adapter table)
+                          (mapcar (lambda (c) (qi adapter c)) cols)
+                          placeholders
+                          conflict-sql
+                          returning-sql)))
+        (values sql (nreverse (sql-state-params st)))))))
 
 (defun render-returning (adapter spec)
   (cond
@@ -67,7 +67,7 @@ so a hostile (or just weird) column name can't escape its quotes."
   "Compile a multi-row INSERT. ROWS is a list of plists. All rows must
 share the same column set; column order is taken from the first row."
   (let* ((st (make-sql-state :adapter adapter))
-         (cols (loop for (k v) on (first rows) by #'cddr collect k))
+         (cols (nth-value 0 (plist-split (first rows))))
          (col-sql (format nil "~{~a~^, ~}" (mapcar (lambda (c) (qi adapter c)) cols)))
          (tuples
            (mapcar (lambda (row)

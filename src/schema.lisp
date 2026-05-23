@@ -229,9 +229,9 @@ Lisp reader. Accepts integers, decimals, and scientific notation. Returns
 
 (defun cast-value (value type &optional options)
   "Coerce VALUE to TYPE. Return (values cast-value ok-p)."
-  (cond
-    ((null value) (values nil t))
-    ((eq type :integer)
+  (when (null value) (return-from cast-value (values nil t)))
+  (case type
+    (:integer
      (typecase value
        (integer (values value t))
        (string
@@ -240,45 +240,39 @@ Lisp reader. Accepts integers, decimals, and scientific notation. Returns
             (let ((n (ignore-errors (parse-integer value :junk-allowed nil))))
               (if n (values n t) (values nil nil)))))
        (t (values nil nil))))
-    ((eq type :float)
+    (:float
      (typecase value
        (number (values (coerce value 'double-float) t))
        (string (multiple-value-bind (n ok) (safe-parse-number value)
                  (if ok (values (coerce n 'double-float) t) (values nil nil))))
        (t (values nil nil))))
-    ((eq type :decimal)
+    (:decimal
      (typecase value
        (rational (values value t))
        (number   (values value t))
        (string   (safe-parse-rational value))
        (t (values nil nil))))
-    ((eq type :string)
+    (:string
      (typecase value
        (string (values value t))
        (t      (values (princ-to-string value) t))))
-    ((eq type :boolean)
+    (:boolean
      ;; Cast keeps boolean values as plain T/NIL — the :FALSE sentinel
      ;; needed by adapters is only introduced later in PREPARE-ROW, where
-     ;; we have field-type context. That avoids :FALSE ever appearing in
-     ;; non-boolean fields by accident.
-     (cond ((member value '(t :true "true" "t" 1) :test #'equal)
-            (values t t))
+     ;; we have field-type context.
+     (cond ((member value '(t :true "true" "t" 1) :test #'equal) (values t t))
            ((member value '(nil :false "false" "f" 0) :test #'equal)
             (values nil t))
            (t (values nil nil))))
-    ((or (eq type :utc-datetime)
-         (eq type :naive-datetime)
-         (eq type :date)
-         (eq type :binary-id))
+    ((:utc-datetime :naive-datetime :date :binary-id)
      (typecase value
        (string (values value t))
        (t      (values nil nil))))
-    ((eq type :enum)
+    (:enum
      (let ((allowed (getf options :values)))
        (cond
          ((null allowed) (values value t))
          ((member value allowed :test #'equal) (values value t))
-         ;; Form-style string input -> coerce to declared keyword/string.
          ((stringp value)
           (let ((hit (find-if (lambda (a) (string-equal value (string a)))
                               allowed)))

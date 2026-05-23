@@ -23,19 +23,9 @@ different threads so prepare/step/finalize don't interleave.")))
 (defun sqlite-close (adapter)
   (sqlite:disconnect (sqlite-db adapter)))
 
-(defmethod adapter-quote-identifier ((a sqlite-adapter) name)
-  (multiple-value-bind (q c) (split-qualified name)
-    (if q (format nil "\"~a\".\"~a\""
-                  (escape-identifier-body q)
-                  (escape-identifier-body c))
-          (format nil "\"~a\"" (escape-identifier-body c)))))
-
 (defmethod adapter-placeholder ((a sqlite-adapter) index)
   (declare (ignore index))
   "?")
-
-(defmethod adapter-last-insert-id ((a sqlite-adapter))
-  (sqlite:last-insert-rowid (sqlite-db a)))
 
 (defmethod adapter-translate-constraint-error ((a sqlite-adapter) c constraints)
   (let ((msg (if (typep c 'sqlite:sqlite-error)

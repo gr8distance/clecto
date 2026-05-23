@@ -123,12 +123,9 @@ Stores child changesets on CS; the repo does NOT auto-persist them in v0.2."
            :valid-p nil))
 
 (defun apply-changes (cs)
-  "Merge changes into data and return the resulting plist (for inserts/updates).
-Does not consult valid-p; caller decides."
-  (let ((out (copy-list (cs-data cs))))
-    (loop for (k v) on (cs-changes cs) by #'cddr do
-      (setf (getf out k) v))
-    out))
+  "Merge changes onto data. Plist lookup picks the leftmost binding, so
+appending changes in front of data is enough."
+  (append (cs-changes cs) (cs-data cs)))
 
 ;;; --- validators (all are (cs ...) -> cs) ---
 
@@ -165,15 +162,18 @@ Sufficient for email-ish '@' checks without pulling in a regex lib."
                                            msg)))
   "Walk CS errors and return an alist keyed by field, each value a list of
 mapped messages. FN is (field message) -> mapped-value."
-  (let ((grouped (make-hash-table :test 'eq))
-        (order nil))
-    (dolist (pair (cs-errors cs))
-      (let ((field (car pair))
-            (msg   (cdr pair)))
-        (unless (gethash field grouped) (push field order))
-        (push (funcall fn field msg) (gethash field grouped))))
-    (mapcar (lambda (field) (cons field (nreverse (gethash field grouped))))
-            (nreverse order))))
+  ;; cs-errors is most-recent-first; walking in reverse gives insertion
+  ;; order. Per field we just push onto the assoc entry — newest mapped
+  ;; message ends up at the head of each field's list.
+  (let ((out nil))
+    (dolist (pair (reverse (cs-errors cs)))
+      (let* ((field (car pair))
+             (mapped (funcall fn field (cdr pair)))
+             (entry (assoc field out)))
+        (if entry
+            (push mapped (cdr entry))
+            (push (list field mapped) out))))
+    (nreverse out)))
 
 (defun apply-action (cs action)
   "If CS is valid, return (values data nil). Otherwise tag CS with ACTION

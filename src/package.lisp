@@ -1,6 +1,6 @@
 (defpackage #:clecto
   (:use #:cl)
-  (:shadow #:union #:intersection #:set-difference)
+  (:shadow #:union)
 
   ;; --- schema ---
   (:export
@@ -45,7 +45,7 @@
   (:export
    #:adapter #:adapter-execute #:adapter-execute-returning
    #:adapter-quote-identifier #:adapter-placeholder
-   #:adapter-last-insert-id #:adapter-supports-returning-p
+   #:adapter-supports-returning-p
    #:adapter-begin #:adapter-commit #:adapter-rollback
    #:adapter-translate-constraint-error
    #:db-error #:db-error-original #:db-error-sql)

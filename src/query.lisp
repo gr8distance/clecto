@@ -44,17 +44,21 @@
   :slots (ctes table wheres selects orders joins groups havings
           distinct combinators lock prefix limit offset))
 
+(defmacro define-appender (name slot &key (transform '(lambda (x) (list x))))
+  "Define (NAME q . items) that appends items (via TRANSFORM) onto SLOT."
+  (let ((accessor (intern (format nil "QUERY-~a" slot))))
+    `(defun ,name (q &rest items)
+       (copy-q q ,(intern (string slot) :keyword)
+               (append (,accessor q) (mapcan ,transform items))))))
+
 (defun from (table)
   (make-query :table table))
 
-(defun where (q expr)
-  (copy-q q :wheres (append (query-wheres q) (list expr))))
+(define-appender where    wheres)
+(define-appender order-by orders :transform #'identity)
 
 (defun select (q fields)
   (copy-q q :selects (alexandria:ensure-list fields)))
-
-(defun order-by (q specs)
-  (copy-q q :orders (append (query-orders q) specs)))
 
 (defun limit (q n)
   (copy-q q :limit n))
@@ -63,28 +67,22 @@
   (copy-q q :offset n))
 
 (defun join (q kind table on)
-  "Add a JOIN clause. KIND is :inner, :left, :right, or :full.
-ON is a where-expression."
+  "Add a JOIN clause. KIND is :inner, :left, :right, or :full."
   (copy-q q :joins (append (query-joins q)
                            (list (list :kind kind :table table :on on)))))
 
 (defun group-by (q cols)
   (copy-q q :groups (append (query-groups q) (alexandria:ensure-list cols))))
 
-(defun having (q expr)
-  (copy-q q :havings (append (query-havings q) (list expr))))
+(define-appender having havings)
 
-(defun union (q other)
-  (copy-q q :combinators (append (query-combinators q) (list (list :union other)))))
+(defun add-combinator (q op other)
+  (copy-q q :combinators (append (query-combinators q) (list (list op other)))))
 
-(defun union-all (q other)
-  (copy-q q :combinators (append (query-combinators q) (list (list :union-all other)))))
-
-(defun intersect (q other)
-  (copy-q q :combinators (append (query-combinators q) (list (list :intersect other)))))
-
-(defun except (q other)
-  (copy-q q :combinators (append (query-combinators q) (list (list :except other)))))
+(defun union     (q other) (add-combinator q :union other))
+(defun union-all (q other) (add-combinator q :union-all other))
+(defun intersect (q other) (add-combinator q :intersect other))
+(defun except    (q other) (add-combinator q :except other))
 
 (defun where-if (q condition expr)
   "Apply WHERE only when CONDITION is truthy. Lets you compose dynamic

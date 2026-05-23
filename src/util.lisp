@@ -1,5 +1,13 @@
 (in-package #:clecto)
 
+(defun plist-split (plist)
+  "Return (values keys values) by walking PLIST once."
+  (loop for (k v) on plist by #'cddr
+        collect k into ks
+        collect v into vs
+        finally (return (values ks vs))))
+
+
 (defmacro define-copier (name &key copier accessor-prefix slots)
   "Define a functional copier: (NAME orig &rest plist-overrides).
 Generates an ECASE over SLOTS, dispatching to the standard struct setters

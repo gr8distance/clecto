@@ -1,6 +1,6 @@
 (defpackage #:clecto/tests
   (:use #:cl #:clecto #:fiveam)
-  (:shadowing-import-from #:clecto #:union #:intersection #:set-difference))
+  (:shadowing-import-from #:clecto #:union))
 (in-package #:clecto/tests)
 
 (def-suite :clecto)
@@ -48,7 +48,6 @@
 (defclass dummy-adapter (clecto:adapter) ())
 (defmethod adapter-execute ((a dummy-adapter) sql params)
   (list (list :sql sql :params params)))
-(defmethod adapter-last-insert-id ((a dummy-adapter)) 0)
 
 (test select-sql
   (let ((a (make-instance 'dummy-adapter))

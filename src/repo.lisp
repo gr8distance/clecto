@@ -32,12 +32,10 @@
 
 (defun repo-get-by (repo schema-name filters)
   "Fetch the first row matching FILTERS (a plist of field/value pairs)."
-  (let* ((schema  (find-schema schema-name))
-         (table   (intern-table schema))
-         (clauses (loop for (k v) on filters by #'cddr collect (list '= k v)))
-         (q       (reduce (lambda (q expr) (where q expr))
-                          clauses
-                          :initial-value (from table))))
+  (let* ((table (intern-table (find-schema schema-name)))
+         (q (from table)))
+    (loop for (k v) on filters by #'cddr
+          do (setf q (where q (list '= k v))))
     (repo-one repo q)))
 
 (defun repo-exists-p (repo query)
@@ -145,6 +143,24 @@ isn't surfaced by default error handling."
             (values nil (add-error cs field message))
             (error 'db-error :original e))))))
 
+(defun do-insert-returning (adapter sql params on-conflict)
+  "PG-style: ask the DB for the inserted row in one round trip. Returns
+the row plist, or NIL when :on-conflict :nothing matched no row."
+  (with-telemetry (adapter sql params)
+    (or (first (adapter-execute adapter sql params))
+        (unless (eq on-conflict :nothing)
+          (error "RETURNING produced no row")))))
+
+(defun do-insert-last-id (adapter sql params schema values)
+  "SQLite-style: execute, take last_insert_rowid from the multi-value
+return, build the inserted row by overlaying the new PK on VALUES."
+  (with-telemetry (adapter sql params)
+    (multiple-value-bind (changes last-id)
+        (adapter-execute-returning adapter sql params)
+      (declare (ignore changes))
+      (let ((pk (schema-primary-key schema)))
+        (list* pk (or (getf values pk) last-id) values)))))
+
 (defun repo-insert (repo cs &key on-conflict conflict-target)
   "Insert from changeset. Returns (values record nil) on success or
 (values nil cs) on validation or constraint failure.
@@ -167,26 +183,9 @@ ON-CONFLICT and CONFLICT-TARGET enable upsert; see INSERT-SQL."
                            :on-conflict on-conflict
                            :conflict-target target
                            :returning (when use-returning t))
-             (let ((record
-                     (with-telemetry (adapter sql params)
-                       (cond
-                         (use-returning
-                          ;; Adapter returns the inserted row (PG style).
-                          ;; If :on-conflict :nothing matched, RETURNING is
-                          ;; empty — treat as a benign no-op insert.
-                          (or (first (adapter-execute adapter sql params))
-                              (when (eq on-conflict :nothing)
-                                (return-from repo-insert (values nil nil)))
-                              (error "RETURNING produced no row")))
-                         (t
-                          ;; SQLite path: returning multi-values gives us
-                          ;; the last id atomically, no extra round-trip.
-                          (multiple-value-bind (changes last-id)
-                              (adapter-execute-returning adapter sql params)
-                            (declare (ignore changes))
-                            (let* ((pk (schema-primary-key schema))
-                                   (id (or (getf values pk) last-id)))
-                              (list* pk id values))))))))
+             (let ((record (if use-returning
+                               (do-insert-returning adapter sql params on-conflict)
+                               (do-insert-last-id adapter sql params schema values))))
                (values record nil))))))))
 
 (defun repo-update (repo cs)
@@ -281,48 +280,63 @@ with a list."
 (defun replace-key (plist key value)
   (list* key value (alexandria:remove-from-plist plist key)))
 
-(defun preload-has-many (repo parent-schema a records &key only-one)
-  (let* ((pk (schema-primary-key parent-schema))
-         (fk (association-foreign-key a))
-         (target (find-schema (association-target a)))
-         (ids (remove-duplicates (mapcar (lambda (r) (getf r pk)) records)
-                                 :test #'equal))
+(defun preload-by-ids (repo records local-key target-table target-key
+                       &key (group-mode :many))
+  "Generic preload step: collect LOCAL-KEY from RECORDS, query
+TARGET-TABLE WHERE TARGET-KEY IN ids, return (values children-by-id).
+GROUP-MODE is :many (list of children per id) or :one (single child).
+Returns a hash table keyed by the local-key value."
+  (let* ((ids (remove-duplicates
+               (remove nil (mapcar (lambda (r) (getf r local-key)) records))
+               :test #'equal))
          (children (when ids
                      (repo-all repo
-                               (where (from (intern-table target))
-                                      (list 'in fk ids)))))
-         (grouped (group-by-key children fk)))
-    (mapcar (lambda (r)
-              (let* ((matches (gethash (getf r pk) grouped))
-                     (value (if only-one (first matches) (or matches nil))))
-                (replace-key r (association-name a) value)))
-            records)))
-
-(defun preload-belongs-to (repo parent-schema a records)
-  (declare (ignore parent-schema))
-  (let* ((fk (association-foreign-key a))
-         (target (find-schema (association-target a)))
-         (target-pk (schema-primary-key target))
-         (fks (remove-duplicates
-               (remove nil (mapcar (lambda (r) (getf r fk)) records))
-               :test #'equal))
-         (parents (when fks
-                    (repo-all repo
-                              (where (from (intern-table target))
-                                     (list 'in target-pk fks)))))
-         (index (make-hash-table :test 'equal)))
-    (dolist (p parents)
-      (setf (gethash (getf p target-pk) index) p))
-    (mapcar (lambda (r)
-              (replace-key r (association-name a) (gethash (getf r fk) index)))
-            records)))
+                               (where (from target-table)
+                                      (list 'in target-key ids))))))
+    (ecase group-mode
+      (:many (group-by-key children target-key))
+      (:one  (let ((h (make-hash-table :test 'equal)))
+               (dolist (c children) (setf (gethash (getf c target-key) h) c))
+               h)))))
 
 (defun preload-one (repo parent-schema a records)
-  (case (association-kind a)
-    (:has-many   (preload-has-many   repo parent-schema a records))
-    (:has-one    (preload-has-many   repo parent-schema a records :only-one t))
-    (:belongs-to (preload-belongs-to repo parent-schema a records))
-    (t (error "Unknown association kind: ~a" (association-kind a)))))
+  (let* ((target (find-schema (association-target a)))
+         (target-table (intern-table target))
+         (assoc-key (association-name a)))
+    (case (association-kind a)
+      (:has-many
+       (let ((grouped (preload-by-ids repo records
+                                      (schema-primary-key parent-schema)
+                                      target-table
+                                      (association-foreign-key a))))
+         (mapcar (lambda (r)
+                   (replace-key r assoc-key
+                                (gethash (getf r (schema-primary-key parent-schema))
+                                         grouped)))
+                 records)))
+      (:has-one
+       (let ((grouped (preload-by-ids repo records
+                                      (schema-primary-key parent-schema)
+                                      target-table
+                                      (association-foreign-key a))))
+         (mapcar (lambda (r)
+                   (replace-key r assoc-key
+                                (first
+                                 (gethash (getf r (schema-primary-key parent-schema))
+                                          grouped))))
+                 records)))
+      (:belongs-to
+       (let ((index (preload-by-ids repo records
+                                    (association-foreign-key a)
+                                    target-table
+                                    (schema-primary-key target)
+                                    :group-mode :one)))
+         (mapcar (lambda (r)
+                   (replace-key r assoc-key
+                                (gethash (getf r (association-foreign-key a))
+                                         index)))
+                 records)))
+      (t (error "Unknown association kind: ~a" (association-kind a))))))
 
 (defun repo-preload (repo schema-name records assocs)
   "Preload one or more associations. RECORDS may be a single plist or a list

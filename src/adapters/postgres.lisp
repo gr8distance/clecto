@@ -35,14 +35,6 @@ for connections that traverse anything but a Unix socket."
 
 (defmethod adapter-supports-returning-p ((a postgres-adapter)) t)
 
-(defmethod adapter-quote-identifier ((a postgres-adapter) name)
-  ;; PG also uses standard ANSI "..."
-  (multiple-value-bind (q c) (split-qualified name)
-    (if q (format nil "\"~a\".\"~a\""
-                  (escape-identifier-body q)
-                  (escape-identifier-body c))
-          (format nil "\"~a\"" (escape-identifier-body c)))))
-
 (defun postgres-encode-param (value)
   "Coerce values for cl-postgres bind:
   T       -> \"t\"   (boolean true in text protocol)
@@ -87,10 +79,6 @@ because every PG insert that needs one uses RETURNING via the repo path."
            'cl-postgres:ignore-row-reader)
           (cl-postgres:exec-query
            conn sql 'cl-postgres:ignore-row-reader)))))
-
-(defmethod adapter-last-insert-id ((a postgres-adapter))
-  (declare (ignore a))
-  (error "Postgres adapter uses RETURNING; last-insert-id is not supported."))
 
 ;;; --- transactions ---
 
