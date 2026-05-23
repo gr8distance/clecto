@@ -3,7 +3,7 @@
   :version "0.1.0"
   :author "ug <gr8.distance@gmail.com>"
   :license "MIT"
-  :depends-on ("alexandria" "sqlite")
+  :depends-on ("alexandria" "sqlite" "jonathan")
   :pathname "src/"
   :components ((:file "package")
                (:file "schema"     :depends-on ("package"))

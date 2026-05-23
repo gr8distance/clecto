@@ -1,5 +1,6 @@
 (defpackage #:clecto/tests
-  (:use #:cl #:clecto #:fiveam))
+  (:use #:cl #:clecto #:fiveam)
+  (:shadowing-import-from #:clecto #:union #:intersection #:set-difference))
 (in-package #:clecto/tests)
 
 (def-suite :clecto)
@@ -119,6 +120,296 @@
            ;; delete
            (repo-delete r 'int-user 2)
            (is (= 1 (length (repo-all r (from :users))))))
+      (sqlite-close a))))
+
+;;; --- security guards ---
+
+(test safe-number-parsing-rejects-reader-injection
+  ;; The reader macro #. would evaluate at parse time on the old impl.
+  ;; safe-parse-number must reject it without side effects.
+  (is (null (nth-value 1 (clecto::safe-parse-number "#.(error \"boom\")"))))
+  (is (null (nth-value 1 (clecto::safe-parse-number "(+ 1 2)"))))
+  (is (null (nth-value 1 (clecto::safe-parse-number "1.2.3"))))
+  (is (= 3.14d0 (nth-value 0 (clecto::safe-parse-number "3.14"))))
+  (is (= 100   (nth-value 0 (clecto::safe-parse-number "1e2")))))
+
+(test identifier-quoting-escapes-and-rejects-nul
+  (let ((a (make-sqlite-adapter ":memory:")))
+    (unwind-protect
+         (progn
+           ;; embedded " is doubled
+           (is (equal "\"weird\"\"col\""
+                      (adapter-quote-identifier a "weird\"col")))
+           ;; NUL byte is rejected
+           (signals error
+             (adapter-quote-identifier a (format nil "x~ay" #\Nul))))
+      (sqlite-close a))))
+
+(test limit-rejects-non-integer
+  (let ((a (make-sqlite-adapter ":memory:"))
+        (q (limit (from :users) "1 OR 1=1")))
+    (unwind-protect
+         (signals error (clecto::select-sql a q))
+      (sqlite-close a))))
+
+(test order-by-direction-whitelist
+  (let ((a (make-sqlite-adapter ":memory:"))
+        (q (order-by (from :users) '((:asc--malicious :id)))))
+    (unwind-protect
+         (signals error (clecto::select-sql a q))
+      (sqlite-close a))))
+
+(test lock-mode-whitelist
+  (let ((a (make-sqlite-adapter ":memory:"))
+        (q (lock (from :users) :boguslock)))
+    (unwind-protect
+         (signals error (clecto::select-sql a q))
+      (sqlite-close a))))
+
+;;; --- dynamic filters (where-if / and-filters) ---
+
+(defschema d-prod "d_prods"
+  (:id    :integer :primary-key t)
+  (:price :integer)
+  (:tag   :string))
+
+(test dynamic-filters
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE d_prods (id INTEGER PRIMARY KEY, price INTEGER, tag TEXT)")
+           (repo-insert-all r 'd-prod '((:price 100 :tag "a")
+                                        (:price 200 :tag "a")
+                                        (:price 300 :tag "b")))
+           ;; conditional where via where-if
+           (let* ((min  150)
+                  (tag  nil)
+                  (q (-> (from :d-prods)
+                         (where-if min  `(>= :price ,min))
+                         (where-if tag  `(= :tag ,tag)))))
+             (is (= 2 (length (repo-all r q)))))
+           ;; and-filters combine
+           (let* ((filter (and-filters '(>= :price 150) '(= :tag "a"))))
+             (is (= 1 (length (repo-all r (where (from :d-prods) filter))))))
+           ;; and-filters with nils -> skip
+           (is (null (and-filters nil nil)))
+           (is (equal '(= :x 1) (and-filters nil '(= :x 1) nil))))
+      (sqlite-close a))))
+
+;;; --- lock / prefix (SQL emission only) ---
+
+(test lock-and-prefix-sql
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (q1 (lock (from :users) :for-update))
+         (q2 (with-prefix (from :users) "tenant_a")))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (sql params) (clecto::select-sql a q1)
+             (declare (ignore params))
+             (is (search "FOR UPDATE" sql)))
+           (multiple-value-bind (sql params) (clecto::select-sql a q2)
+             (declare (ignore params))
+             (is (search "FROM \"tenant_a\".\"users\"" sql))))
+      (sqlite-close a))))
+
+;;; --- union / intersect / except ---
+
+(defschema set-row "set_t"
+  (:n :integer))
+
+(test set-operations
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE set_t (n INTEGER)")
+           (repo-insert-all r 'set-row '((:n 1) (:n 2) (:n 3)))
+           (let* ((q1 (select (where (from :set-t) '(<= :n 2)) '(:n)))
+                  (q2 (select (where (from :set-t) '(>= :n 2)) '(:n))))
+             ;; UNION (dedup): {1, 2} ∪ {2, 3} = {1, 2, 3}
+             (is (= 3 (length (repo-all r (clecto:union q1 q2)))))
+             ;; UNION ALL: keeps duplicates
+             (is (= 4 (length (repo-all r (union-all q1 q2)))))
+             ;; INTERSECT: {2}
+             (is (= 1 (length (repo-all r (intersect q1 q2)))))
+             ;; EXCEPT: {1, 2} − {2, 3} = {1}
+             (is (= 1 (length (repo-all r (except q1 q2)))))))
+      (sqlite-close a))))
+
+;;; --- distinct / subquery / CTE ---
+
+(defschema d-user "d_users"
+  (:id   :integer :primary-key t)
+  (:role :string))
+
+(test distinct-and-subquery-and-cte
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE d_users (id INTEGER PRIMARY KEY, role TEXT)")
+           (repo-insert-all r 'd-user '((:role "admin") (:role "admin") (:role "user")))
+           ;; DISTINCT
+           (let ((rows (repo-all r (distinct (select (from :d-users) '(:role))))))
+             (is (= 2 (length rows))))
+           ;; subquery in FROM
+           (let* ((inner (select (from :d-users) '(:role)))
+                  (rows  (repo-all r (from (subquery inner :alias :s)))))
+             (is (= 3 (length rows))))
+           ;; subquery in WHERE IN
+           (let* ((inner (select (where (from :d-users) '(= :role "admin")) '(:id)))
+                  (rows  (repo-all r (where (from :d-users) (list 'in :id (subquery inner))))))
+             (is (= 2 (length rows))))
+           ;; CTE
+           (let* ((cte-q (from :d-users))
+                  (main  (with-cte (from :cte-users) :cte-users cte-q))
+                  (rows  (repo-all r main)))
+             (is (= 3 (length rows)))))
+      (sqlite-close a))))
+
+;;; --- embeds + cast-embed / cast-assoc ---
+
+(defschema em-address "addresses"
+  (:street :string)
+  (:city   :string))
+
+(defschema em-user "em_users"
+  (:id      :integer :primary-key t)
+  (:email   :string)
+  (:address :embeds-one em-address)
+  (:tags    :embeds-many em-address))
+
+(defun em-address-changeset (attrs)
+  (-> (cast 'em-address attrs '(:street :city))
+      (validate-required '(:street))))
+
+(test embeds-cast-and-persist
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE em_users (id INTEGER PRIMARY KEY, email TEXT, address TEXT, tags TEXT)")
+           (let* ((attrs '(:email "a@b"
+                           :address (:street "1 Main" :city "Tokyo")
+                           :tags    ((:street "Home") (:street "Office"))))
+                  (cs (-> (cast 'em-user attrs '(:email))
+                          (cast-embed :address attrs #'em-address-changeset)
+                          (cast-embed :tags    attrs #'em-address-changeset))))
+             (is (cs-valid-p cs))
+             ;; child changesets attached to cs changes
+             (is (changeset-p (get-change cs :address)))
+             (is (every #'changeset-p (get-change cs :tags)))
+             ;; persist: JSON-encoded in the DB
+             (repo-insert r cs)
+             (let ((row (repo-get r 'em-user 1)))
+               (is (search "Tokyo" (getf row :address)))
+               (is (search "Home"  (getf row :tags))))))
+      (sqlite-close a))))
+
+(test embed-invalid-child-bubbles-up
+  (let* ((attrs '(:email "a@b" :address (:city "no street")))
+         (cs (cast-embed (cast 'em-user attrs '(:email))
+                         :address attrs #'em-address-changeset)))
+    (is (not (cs-valid-p cs)))
+    (is (assoc :address (cs-errors cs)))))
+
+;;; --- traverse-errors / apply-action ---
+
+(defschema ta-user "ta_users"
+  (:id    :integer :primary-key t)
+  (:email :string)
+  (:age   :integer))
+
+(test traverse-errors-and-apply-action
+  ;; collect errors grouped by field
+  (let* ((cs (-> (cast 'ta-user '(:email "" :age -1) '(:email :age))
+                 (validate-required '(:email))
+                 (validate-number :age :>= 0))))
+    (let ((traversed (traverse-errors cs)))
+      (is (find :email traversed :key #'car))
+      (is (find :age   traversed :key #'car))))
+  ;; valid cs -> apply-action returns data
+  (multiple-value-bind (data err)
+      (apply-action (cast 'ta-user '(:email "a@b" :age 20) '(:email :age))
+                    :insert)
+    (is (equal "a@b" (getf data :email)))
+    (is (null err)))
+  ;; invalid cs -> apply-action returns the cs tagged with action
+  (multiple-value-bind (data err)
+      (apply-action (validate-required (cast 'ta-user '() '(:email)) '(:email))
+                    :insert)
+    (is (null data))
+    (is (eq :insert (cs-action err)))))
+
+;;; --- extended validators ---
+
+(defschema val-user "val_users"
+  (:id    :integer :primary-key t)
+  (:role  :string)
+  (:tags  :string)
+  (:terms :boolean :virtual t)
+  (:password :string :virtual t)
+  (:password-confirmation :string :virtual t))
+
+(test extended-validators
+  ;; inclusion
+  (is (cs-valid-p (validate-inclusion (cast 'val-user '(:role "admin") '(:role))
+                                      :role '("admin" "user"))))
+  (is (not (cs-valid-p (validate-inclusion (cast 'val-user '(:role "x") '(:role))
+                                           :role '("admin" "user")))))
+  ;; exclusion
+  (is (not (cs-valid-p (validate-exclusion (cast 'val-user '(:role "admin") '(:role))
+                                           :role '("admin")))))
+  ;; subset
+  (is (cs-valid-p (validate-subset
+                   (put-change (cast 'val-user '() '()) :tags '("a" "b"))
+                   :tags '("a" "b" "c"))))
+  ;; confirmation
+  (is (cs-valid-p
+       (validate-confirmation
+        (cast 'val-user '(:password "x" :password-confirmation "x")
+              '(:password :password-confirmation))
+        :password)))
+  (is (not (cs-valid-p
+            (validate-confirmation
+             (cast 'val-user '(:password "x" :password-confirmation "y")
+                   '(:password :password-confirmation))
+             :password))))
+  ;; acceptance
+  (is (cs-valid-p (validate-acceptance
+                   (cast 'val-user '(:terms t) '(:terms)) :terms)))
+  (is (not (cs-valid-p (validate-acceptance
+                        (cast 'val-user '(:terms nil) '(:terms)) :terms)))))
+
+;;; --- virtual fields + enum ---
+
+(defschema vf-user "vf_users"
+  (:id       :integer :primary-key t)
+  (:email    :string)
+  (:status   :enum :values '(:draft :published))
+  (:password :string :virtual t))
+
+(test virtual-and-enum
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE vf_users (id INTEGER PRIMARY KEY, email TEXT, status TEXT)")
+           ;; virtual field accepted into changeset but not persisted
+           (let* ((cs (cast 'vf-user '(:email "a@b" :status "published" :password "s3cret")
+                            '(:email :status :password))))
+             (is (cs-valid-p cs))
+             (is (equal :published (get-change cs :status)))    ; enum coerced
+             (is (equal "s3cret"   (get-change cs :password)))  ; virtual lives in cs
+             (multiple-value-bind (rec err) (repo-insert r cs)
+               (is (null err))
+               ;; the inserted record (we return all values that hit DB)
+               (is (not (member :password rec)))))               ; virtual filtered
+           ;; enum rejects bad value
+           (let ((cs (cast 'vf-user '(:status "bogus") '(:status))))
+             (is (not (cs-valid-p cs)))
+             (is (assoc :status (cs-errors cs)))))
       (sqlite-close a))))
 
 ;;; --- fragment escape hatch ---

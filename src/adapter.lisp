@@ -18,10 +18,19 @@ PARAMS is a list of values in the order their placeholders appear."))
    "Execute SQL that mutates and return (values rows-affected last-insert-id).
 For RETURNING-style adapters this can be specialized to return rows instead."))
 
+(defvar *lispify-cache* (make-hash-table :test 'equal)
+  "String -> keyword cache so the same DB column name never re-interns.
+Bounds memory growth to the set of distinct column names actually emitted
+by the database (developer-controlled in practice).")
+
 (defun lispify-column (name)
-  "DB column name -> keyword: \"user_id\" -> :USER-ID."
-  (alexandria:make-keyword
-   (string-upcase (substitute #\- #\_ (string name)))))
+  "DB column name -> keyword: \"user_id\" -> :USER-ID. Cached to avoid
+unbounded keyword interning on hot query paths."
+  (let ((s (string name)))
+    (or (gethash s *lispify-cache*)
+        (setf (gethash s *lispify-cache*)
+              (alexandria:make-keyword
+               (string-upcase (substitute #\- #\_ s)))))))
 
 (defun sqlify-column (name)
   "Keyword -> DB column name: :user-id -> \"user_id\"."
@@ -35,13 +44,26 @@ For RETURNING-style adapters this can be specialized to return rows instead."))
         (values (subseq s 0 dot) (subseq s (1+ dot)))
         (values nil s))))
 
+(defun escape-identifier-body (s)
+  "Escape the inside of a double-quoted SQL identifier: \"\"\"\" doubles the
+quote, NUL is rejected outright."
+  (when (find #\Nul s)
+    (error "Identifier contains NUL byte: ~s" s))
+  (if (find #\" s)
+      (with-output-to-string (out)
+        (loop for c across s do
+          (if (char= c #\") (write-string "\"\"" out) (write-char c out))))
+      s))
+
 (defgeneric adapter-quote-identifier (adapter name)
   (:documentation "Quote a column/table identifier per the dialect.
 Handles qualified names like :users.id -> \"users\".\"id\".")
   (:method ((a adapter) name)
     (multiple-value-bind (q c) (split-qualified name)
-      (if q (format nil "\"~a\".\"~a\"" q c)
-            (format nil "\"~a\"" c)))))
+      (if q (format nil "\"~a\".\"~a\""
+                    (escape-identifier-body q)
+                    (escape-identifier-body c))
+            (format nil "\"~a\"" (escape-identifier-body c))))))
 
 (defgeneric adapter-placeholder (adapter index)
   (:documentation "Render the Nth (1-based) parameter placeholder.")

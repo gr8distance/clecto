@@ -47,6 +47,33 @@
 
 ;;; --- mutations: take a changeset, return (values record-or-nil cs) ---
 
+(defun drop-virtual (schema values)
+  "Remove virtual fields (declared with :virtual t) so they never reach SQL."
+  (let ((virtual (loop for f in (schema-fields schema)
+                       when (field-virtual-p f) collect (field-name f))))
+    (if virtual
+        (apply #'alexandria:remove-from-plist values virtual)
+        values)))
+
+(defun encode-embeds (schema values)
+  "Serialize embedded changeset(s) under embed fields to JSON strings."
+  (let ((embeds (remove-if-not
+                 (lambda (a)
+                   (member (association-kind a) '(:embeds-one :embeds-many)))
+                 (schema-assocs schema))))
+    (if (null embeds) values
+        (let ((out (copy-list values)))
+          (dolist (a embeds)
+            (let* ((key (association-name a))
+                   (v   (getf out key)))
+              (when v
+                (setf (getf out key)
+                      (case (association-kind a)
+                        (:embeds-one  (jonathan:to-json (apply-changes v)))
+                        (:embeds-many (jonathan:to-json
+                                       (mapcar #'apply-changes v))))))))
+          out))))
+
 (defun stamp-insert (schema values)
   "If SCHEMA opts into :timestamps, set inserted-at and updated-at."
   (if (schema-timestamps-p schema)
@@ -84,7 +111,9 @@ ON-CONFLICT and CONFLICT-TARGET enable upsert; see INSERT-SQL."
        (lambda ()
          (let* ((schema (find-schema (cs-schema cs)))
                 (table  (intern-table schema))
-                (values (stamp-insert schema (apply-changes cs)))
+                (values (encode-embeds schema
+                                       (drop-virtual schema
+                                                     (stamp-insert schema (apply-changes cs)))))
                 (target (or conflict-target
                             (and on-conflict (schema-primary-key schema)))))
            (multiple-value-bind (sql params)
@@ -109,7 +138,9 @@ ON-CONFLICT and CONFLICT-TARGET enable upsert; see INSERT-SQL."
                 (table   (intern-table schema))
                 (pk      (schema-primary-key schema))
                 (id      (getf (cs-data cs) pk))
-                (changes (stamp-update schema (cs-changes cs))))
+                (changes (encode-embeds schema
+                                        (drop-virtual schema
+                                                      (stamp-update schema (cs-changes cs))))))
            (unless id (error "repo-update: data is missing primary key ~a" pk))
            (multiple-value-bind (sql params)
                (update-sql (repo-adapter repo) table changes (list '= pk id))

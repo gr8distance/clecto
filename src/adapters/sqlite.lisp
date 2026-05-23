@@ -18,8 +18,10 @@
 
 (defmethod adapter-quote-identifier ((a sqlite-adapter) name)
   (multiple-value-bind (q c) (split-qualified name)
-    (if q (format nil "\"~a\".\"~a\"" q c)
-          (format nil "\"~a\"" c))))
+    (if q (format nil "\"~a\".\"~a\""
+                  (escape-identifier-body q)
+                  (escape-identifier-body c))
+          (format nil "\"~a\"" (escape-identifier-body c)))))
 
 (defmethod adapter-placeholder ((a sqlite-adapter) index)
   (declare (ignore index))
@@ -65,7 +67,7 @@
     (unwind-protect
          (progn
            (loop for p in params for i from 1
-                 do (sqlite:bind-parameter stmt i p))
+                 do (sqlite:bind-parameter stmt i (sqlite-encode-param p)))
            (let* ((names (sqlite:statement-column-names stmt))
                   (keys (mapcar #'lispify-column names)))
              (loop while (sqlite:step-statement stmt)
@@ -103,6 +105,16 @@
 
 (defmethod adapter-execute-returning ((a sqlite-adapter) sql params)
   "Execute a mutating statement. Returns (values changes last-insert-id)."
-  (apply #'sqlite:execute-non-query (sqlite-db a) sql params)
+  (apply #'sqlite:execute-non-query (sqlite-db a) sql
+         (mapcar #'sqlite-encode-param params))
   (values (sqlite:execute-single (sqlite-db a) "SELECT changes()")
           (sqlite:last-insert-rowid (sqlite-db a))))
+
+(defun sqlite-encode-param (value)
+  "Coerce values SQLite can't natively bind: keywords, booleans, etc."
+  (cond
+    ((eq value t)   1)
+    ((null value)   nil)
+    ((keywordp value) (string-downcase (symbol-name value)))
+    ((symbolp value)  (string-downcase (symbol-name value)))
+    (t value)))
