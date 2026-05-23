@@ -855,6 +855,51 @@
              (is (equal "outer" (getf (first rows) :email)))))
       (sqlite-close a))))
 
+;;; --- update set values: fragments + column refs ---
+
+(defschema cnt-row "cnt"
+  (:id :integer :primary-key t)
+  (:n  :integer))
+
+(test update-set-boolean-false-still-parameterized
+  ;; Regression: UPDATE SET col = NIL ends up encoded as the :false
+  ;; sentinel by encode-booleans, then must render as a PARAMETER
+  ;; (0 / 'f'), not as the column reference "false".
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE bf (id INTEGER PRIMARY KEY, flag INTEGER)")
+           (clecto:defschema bf-row "bf"
+             (:id   :integer :primary-key t)
+             (:flag :boolean))
+           (repo-insert r (cast 'bf-row '(:flag t) '(:flag)))
+           (let ((cs (put-change
+                      (cast (list :__schema__ 'bf-row :id 1) '() '())
+                      :flag nil)))
+             (repo-update r cs))
+           (is (= 0 (getf (repo-get r 'bf-row 1) :flag))))
+      (sqlite-close a))))
+
+(test update-set-accepts-sql-expression
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE cnt (id INTEGER PRIMARY KEY, n INTEGER)")
+           (repo-insert r (cast 'cnt-row '(:n 5) '(:n)))
+           ;; Atomic increment without a read-modify-write race.
+           (repo-update-all r
+                            (where (from :cnt) '(= :id 1))
+                            (list :n (list :fragment "\"n\" + ?" 3)))
+           (is (= 8 (getf (repo-get r 'cnt-row 1) :n)))
+           ;; Plain literal value still works.
+           (repo-update-all r
+                            (where (from :cnt) '(= :id 1))
+                            '(:n 42))
+           (is (= 42 (getf (repo-get r 'cnt-row 1) :n))))
+      (sqlite-close a))))
+
 ;;; --- bulk: insert-all / update-all / delete-all ---
 
 (defschema bulk-user "bulk_users"

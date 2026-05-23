@@ -80,13 +80,38 @@ share the same column set; column order is taken from the first row."
                       (qi adapter table) col-sql tuples)))
     (values sql (nreverse (sql-state-params st)))))
 
+(defun compile-set-value (st v)
+  "Compile a value sitting on the right-hand side of an UPDATE SET pair.
+A keyword is treated as a column reference (so :col1 := :col2 works);
+a (:fragment ...) form expands to its raw-SQL body with safe parameter
+substitution (used by clauth's atomic increment); anything else is a
+parameter binding.
+
+NB: the boolean sentinels :TRUE and :FALSE (introduced by the
+schema-aware encoder in ENCODE-BOOLEANS) are routed through
+EMIT-PARAM so the adapter can render them as 0/1 / 't'/'f' — they
+must not get the generic 'keyword → column ref' treatment that would
+otherwise turn UPDATE flag = :FALSE into UPDATE flag = \"false\".
+
+DEVELOPER-TRUST CONTRACT: :fragment templates and bare-keyword column
+refs are interpreted as raw SQL pieces. Never thread untrusted input
+into either side; the cast layer already coerces typed fields, but an
+untyped field accepting raw (put-change ...) input has no such guard."
+  (cond
+    ((or (eq v :true) (eq v :false)) (emit-param st v))
+    (t (compile-operand st v))))
+
 (defun update-sql (adapter table set-plist where-expr)
+  "Compile an UPDATE statement. SET-PLIST values are run through
+COMPILE-SET-VALUE so callers can do
+    (list :counter (list :fragment \"counter + 1\"))
+to get an atomic SQL-side increment."
   (let* ((st (make-sql-state :adapter adapter))
          (set-pairs
            (loop for (k v) on set-plist by #'cddr
                  collect (format nil "~a = ~a"
                                  (qi adapter k)
-                                 (emit-param st v))))
+                                 (compile-set-value st v))))
          (where-sql (when where-expr
                       (format nil " WHERE ~a" (compile-expr st where-expr))))
          (sql (format nil "UPDATE ~a SET ~{~a~^, ~}~@[~a~]"
