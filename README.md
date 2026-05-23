@@ -149,7 +149,41 @@ Where-expressions are S-expressions. Supported operators:
 (like COL "pat%")
 (is-null COL)   (is-not-null COL)
 (and EXPR EXPR ...)   (or EXPR EXPR ...)   (not EXPR)
+(:fragment "raw sql with ? holes" arg1 arg2 ...)
 ```
+
+Aggregates work in `select` and `having`:
+
+```
+(:count :id)   (:count :*)   (:sum :age)   (:avg :age)   (:min ...)   (:max ...)
+```
+
+### Joins, group-by, having
+
+Qualified column names use a dotted keyword (`:users.id`).
+
+```lisp
+(-> (from :users)
+    (join :inner :posts '(= :users.id :posts.user-id))
+    (where '(= :users.email "a@b"))
+    (group-by :users.id)
+    (having '(> (:count :posts.id) 3))
+    (select '(:users.id (:count :posts.id))))
+```
+
+Supported join kinds: `:inner`, `:left`, `:right`, `:full`
+(dialect-dependent).
+
+### Fragment — raw SQL escape hatch
+
+When the DSL doesn't reach, drop down to SQL:
+
+```lisp
+(where q '(:fragment "lower(?) = ?" :email "abc@example.com"))
+(select q '((:fragment "coalesce(?, 0)" :score)))
+```
+
+Keyword args become inlined identifiers; everything else is parameterized.
 
 Every builder returns a fresh `query` — composing two pipelines never
 mutates a shared object.
@@ -193,18 +227,78 @@ Column-name translation between Lisp keywords (`:user-id`) and DB columns
 ```lisp
 (defparameter *repo* (make-repo (make-sqlite-adapter "app.db")))
 
-(repo-all    *repo* (from :users))                  ; => list of plists
-(repo-one    *repo* (where (from :users) '(= :id 1)))
-(repo-get    *repo* 'user 1)                        ; by primary key
-(repo-insert *repo* changeset)                      ; => (values record err)
+;; reads
+(repo-all      *repo* (from :users))
+(repo-one      *repo* (where (from :users) '(= :id 1)))
+(repo-get      *repo* 'user 1)                        ; by primary key
+(repo-get-by   *repo* 'user '(:email "a@b"))          ; by arbitrary fields
+(repo-exists-p *repo* (where (from :users) '(= :email "a@b")))
+
+;; single-row writes (changeset-based)
+(repo-insert *repo* changeset)                        ; => (values record err)
 (repo-update *repo* changeset)
 (repo-delete *repo* 'user 1)
-(repo-execute *repo* "VACUUM")                      ; raw SQL escape hatch
+
+;; bulk writes (no changeset)
+(repo-insert-all *repo* 'user '((:email "a@b") (:email "c@d")))
+(repo-update-all *repo* (where (from :users) '(>= :age 18)) '(:status "adult"))
+(repo-delete-all *repo* (where (from :users) '(= :status "banned")))
+
+;; upsert
+(repo-insert *repo* cs :on-conflict :replace :conflict-target :email)
+(repo-insert *repo* cs :on-conflict :nothing)
+(repo-insert *repo* cs :on-conflict '(:replace :age :updated-at))
+
+;; raw SQL escape hatch
+(repo-execute *repo* "VACUUM")
 ```
 
 `repo-insert` / `repo-update` return `(values record nil)` on success and
-`(values nil invalid-changeset)` on validation failure. No exceptions for the
-expected case.
+`(values nil invalid-changeset)` on validation or constraint failure.
+
+### Transactions
+
+```lisp
+(repo-transaction (*repo*)
+  (repo-insert *repo* cs1)
+  (repo-insert *repo* cs2))
+
+;; Abort cleanly from anywhere inside:
+(repo-transaction (*repo*)
+  (when (something-bad) (rollback))
+  ...)
+```
+
+Nesting uses savepoints automatically. Any unhandled error inside the body
+rolls back the (sub)transaction.
+
+### Constraint errors as changeset errors
+
+Declare which DB constraint should land on which field, then let the repo
+translate failures:
+
+```lisp
+(-> (cast 'user attrs '(:email))
+    (validate-required '(:email))
+    (unique-constraint :email :message "already taken")
+    (foreign-key-constraint :role-id))
+
+;; If insert fails with UNIQUE/FOREIGN KEY, you get back the changeset
+;; with the right error attached — no exception escapes.
+```
+
+### Timestamps
+
+Opt in by adding `(:timestamps)` to the schema body. `:inserted-at` and
+`:updated-at` (type `:naive-datetime`) are added to the field list and
+auto-populated on insert/update.
+
+```lisp
+(defschema user "users"
+  (:id    :integer :primary-key t)
+  (:email :string)
+  (:timestamps))
+```
 
 ### Adapter — the dialect protocol
 

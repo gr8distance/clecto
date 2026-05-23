@@ -4,21 +4,29 @@
 ;;; All operations return a fresh changeset — the data never mutates.
 
 (defstruct changeset
-  (schema   nil :type (or null symbol))
-  (data     nil :type list)   ; plist: existing record
-  (changes  nil :type list)   ; plist: proposed changes
-  (errors   nil :type list)   ; alist: ((field . message) ...)
-  (valid-p  t   :type boolean))
+  (schema      nil :type (or null symbol))
+  (data        nil :type list)   ; plist: existing record
+  (changes     nil :type list)   ; plist: proposed changes
+  (errors      nil :type list)   ; alist: ((field . message) ...)
+  (constraints nil :type list)   ; list of CONSTRAINT
+  (valid-p     t   :type boolean))
+
+(defstruct constraint
+  (kind    nil :type keyword)   ; :unique :foreign-key
+  (column  nil)                 ; column name for matching (string or keyword)
+  (field   nil :type keyword)   ; cs field to attach the error to
+  (message nil :type string))
 
 (defun copy-cs (cs &rest overrides)
   (let ((c (copy-changeset cs)))
     (loop for (slot val) on overrides by #'cddr do
       (ecase slot
-        (:schema   (setf (changeset-schema c) val))
-        (:data     (setf (changeset-data c) val))
-        (:changes  (setf (changeset-changes c) val))
-        (:errors   (setf (changeset-errors c) val))
-        (:valid-p  (setf (changeset-valid-p c) val))))
+        (:schema      (setf (changeset-schema c) val))
+        (:data        (setf (changeset-data c) val))
+        (:changes     (setf (changeset-changes c) val))
+        (:errors      (setf (changeset-errors c) val))
+        (:constraints (setf (changeset-constraints c) val))
+        (:valid-p     (setf (changeset-valid-p c) val))))
     c))
 
 (defun cs-data    (cs) (changeset-data cs))
@@ -117,6 +125,25 @@ Sufficient for email-ish '@' checks without pulling in a regex lib."
              (or (null =)  (cl:=  v =)))
         cs
         (add-error cs field message))))
+
+(defun cs-constraints (cs) (changeset-constraints cs))
+
+(defun unique-constraint (cs field &key (message "has already been taken") column)
+  "Declare that a UNIQUE violation on COLUMN (defaults to FIELD) should
+appear as an error on FIELD when the next repo-insert/update fails."
+  (copy-cs cs
+           :constraints
+           (cons (make-constraint :kind :unique
+                                  :column (or column field)
+                                  :field field
+                                  :message message)
+                 (cs-constraints cs))))
+
+(defun foreign-key-constraint (cs field &key (message "does not exist"))
+  (copy-cs cs
+           :constraints
+           (cons (make-constraint :kind :foreign-key :field field :message message)
+                 (cs-constraints cs))))
 
 (defun validate-length (cs field &key min max (message "has invalid length"))
   (let ((v (get-field cs field)))

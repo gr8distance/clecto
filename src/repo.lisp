@@ -28,42 +28,133 @@
     (repo-one repo
               (where (from (intern-table schema)) (list '= pk id)))))
 
+(defun repo-get-by (repo schema-name filters)
+  "Fetch the first row matching FILTERS (a plist of field/value pairs)."
+  (let* ((schema  (find-schema schema-name))
+         (table   (intern-table schema))
+         (clauses (loop for (k v) on filters by #'cddr collect (list '= k v)))
+         (q       (reduce (lambda (q expr) (where q expr))
+                          clauses
+                          :initial-value (from table))))
+    (repo-one repo q)))
+
+(defun repo-exists-p (repo query)
+  "Return T if any row matches QUERY."
+  (not (null (repo-one repo query))))
+
 (defun intern-table (schema)
   (alexandria:make-keyword (string-upcase (schema-table schema))))
 
 ;;; --- mutations: take a changeset, return (values record-or-nil cs) ---
 
-(defun repo-insert (repo cs)
-  "Insert from changeset. Returns (values record nil) on success
-or (values nil cs) when invalid."
+(defun stamp-insert (schema values)
+  "If SCHEMA opts into :timestamps, set inserted-at and updated-at."
+  (if (schema-timestamps-p schema)
+      (let ((now (now-naive-datetime)))
+        (list* :inserted-at now :updated-at now
+               (alexandria:remove-from-plist values :inserted-at :updated-at)))
+      values))
+
+(defun stamp-update (schema changes)
+  (if (schema-timestamps-p schema)
+      (list* :updated-at (now-naive-datetime)
+             (alexandria:remove-from-plist changes :updated-at))
+      changes))
+
+(defun catch-constraint-error (adapter cs thunk)
+  "Run THUNK. If it signals a DB error matching a constraint declared on CS,
+return (values nil cs-with-error). Otherwise propagate."
+  (handler-case (funcall thunk)
+    (error (e)
+      (multiple-value-bind (field message)
+          (adapter-translate-constraint-error adapter e (cs-constraints cs))
+        (if field
+            (values nil (add-error cs field message))
+            (error e))))))
+
+(defun repo-insert (repo cs &key on-conflict conflict-target)
+  "Insert from changeset. Returns (values record nil) on success or
+(values nil cs) on validation or constraint failure.
+
+ON-CONFLICT and CONFLICT-TARGET enable upsert; see INSERT-SQL."
   (if (not (cs-valid-p cs))
       (values nil cs)
-      (let* ((schema (find-schema (cs-schema cs)))
-             (table  (intern-table schema))
-             (values (apply-changes cs)))
-        (multiple-value-bind (sql params)
-            (insert-sql (repo-adapter repo) table values)
-          (adapter-execute-returning (repo-adapter repo) sql params)
-          (let* ((pk (schema-primary-key schema))
-                 (id (or (getf values pk)
-                         (adapter-last-insert-id (repo-adapter repo))))
-                 (record (list* pk id values)))
-            (values record nil))))))
+      (catch-constraint-error
+       (repo-adapter repo) cs
+       (lambda ()
+         (let* ((schema (find-schema (cs-schema cs)))
+                (table  (intern-table schema))
+                (values (stamp-insert schema (apply-changes cs)))
+                (target (or conflict-target
+                            (and on-conflict (schema-primary-key schema)))))
+           (multiple-value-bind (sql params)
+               (insert-sql (repo-adapter repo) table values
+                           :on-conflict on-conflict
+                           :conflict-target target)
+             (adapter-execute-returning (repo-adapter repo) sql params)
+             (let* ((pk (schema-primary-key schema))
+                    (id (or (getf values pk)
+                            (adapter-last-insert-id (repo-adapter repo))))
+                    (record (list* pk id values)))
+               (values record nil))))))))
 
 (defun repo-update (repo cs)
   "Update the row identified by the changeset's data (must include PK)."
   (if (not (cs-valid-p cs))
       (values nil cs)
-      (let* ((schema (find-schema (cs-schema cs)))
-             (table  (intern-table schema))
-             (pk     (schema-primary-key schema))
-             (id     (getf (cs-data cs) pk)))
-        (unless id (error "repo-update: data is missing primary key ~a" pk))
-        (multiple-value-bind (sql params)
-            (update-sql (repo-adapter repo) table (cs-changes cs)
-                        (list '= pk id))
-          (adapter-execute-returning (repo-adapter repo) sql params)
-          (values (apply-changes cs) nil)))))
+      (catch-constraint-error
+       (repo-adapter repo) cs
+       (lambda ()
+         (let* ((schema  (find-schema (cs-schema cs)))
+                (table   (intern-table schema))
+                (pk      (schema-primary-key schema))
+                (id      (getf (cs-data cs) pk))
+                (changes (stamp-update schema (cs-changes cs))))
+           (unless id (error "repo-update: data is missing primary key ~a" pk))
+           (multiple-value-bind (sql params)
+               (update-sql (repo-adapter repo) table changes (list '= pk id))
+             (adapter-execute-returning (repo-adapter repo) sql params)
+             (values (append changes (cs-data cs)) nil)))))))
+
+(defun repo-insert-all (repo schema-name rows)
+  "Bulk insert ROWS (a list of plists). Auto-stamps timestamps when enabled.
+Returns the number of rows inserted."
+  (when rows
+    (let* ((schema (find-schema schema-name))
+           (table  (intern-table schema))
+           (stamped (if (schema-timestamps-p schema)
+                        (let ((now (now-naive-datetime)))
+                          (mapcar (lambda (r)
+                                    (list* :inserted-at now :updated-at now
+                                           (alexandria:remove-from-plist
+                                            r :inserted-at :updated-at)))
+                                  rows))
+                        rows)))
+      (multiple-value-bind (sql params)
+          (insert-all-sql (repo-adapter repo) table stamped)
+        (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params))))))
+
+(defun repo-update-all (repo query set-plist)
+  "Bulk UPDATE rows matching QUERY with SET-PLIST. Returns rows affected."
+  (let* ((table (query-table query))
+         (where (when (query-wheres query)
+                  (if (= 1 (length (query-wheres query)))
+                      (first (query-wheres query))
+                      (cons 'and (query-wheres query))))))
+    (multiple-value-bind (sql params)
+        (update-sql (repo-adapter repo) table set-plist where)
+      (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params)))))
+
+(defun repo-delete-all (repo query)
+  "Bulk DELETE rows matching QUERY. Returns rows affected."
+  (let* ((table (query-table query))
+         (where (when (query-wheres query)
+                  (if (= 1 (length (query-wheres query)))
+                      (first (query-wheres query))
+                      (cons 'and (query-wheres query))))))
+    (multiple-value-bind (sql params)
+        (delete-sql (repo-adapter repo) table where)
+      (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params)))))
 
 (defun repo-delete (repo schema-name id)
   (let* ((schema (find-schema schema-name))
@@ -148,6 +239,43 @@ Returns RECORDS with each association attached under its declared name."
           (error "Schema ~a has no association ~a" schema-name n))
         (setf result (preload-one repo schema a result))))
     (if single-p (first result) result)))
+
+;;; --- transactions ---
+
+(defun call-with-transaction (repo thunk)
+  "Run THUNK inside a transaction. If THUNK signals a CLECTO:ROLLBACK
+condition or any other error, the transaction is rolled back. Otherwise
+it commits. Nesting uses savepoints."
+  (let ((adapter (repo-adapter repo))
+        (committed nil))
+    (adapter-begin adapter)
+    (unwind-protect
+         (handler-case
+             (let ((result (funcall thunk)))
+               (adapter-commit adapter)
+               (setf committed t)
+               result)
+           (rollback ()
+             (adapter-rollback adapter)
+             (setf committed t)
+             nil))
+      (unless committed
+        (adapter-rollback adapter)))))
+
+(defmacro repo-transaction ((repo) &body body)
+  "Run BODY inside a transaction on REPO.
+
+  (repo-transaction (*repo*)
+    (repo-insert *repo* cs1)
+    (repo-insert *repo* cs2))
+
+Signal CLECTO:ROLLBACK from within BODY to abort cleanly. Any other
+condition also rolls back and is re-raised."
+  `(call-with-transaction ,repo (lambda () ,@body)))
+
+(defun rollback ()
+  "Abort the enclosing repo-transaction."
+  (signal 'rollback))
 
 ;;; --- escape hatch for raw SQL / migrations ---
 
