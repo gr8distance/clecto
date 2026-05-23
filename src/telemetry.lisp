@@ -20,10 +20,20 @@
   "Default NIL. Params often contain passwords, tokens, PII — they only
 appear in telemetry payloads when this is explicitly set to T.")
 
+(defvar *telemetry-handler-failed* nil
+  "Set the first time the telemetry callback signals an error, so a
+mis-wired backend doesn't go completely silent.")
+
 (defun emit-event (event payload)
   (when *telemetry*
     (handler-case (funcall *telemetry* event payload)
-      (error () nil))))    ; never let telemetry break the call site
+      (error (e)
+        (unless *telemetry-handler-failed*
+          (setf *telemetry-handler-failed* t)
+          (format *error-output*
+                  "~&clecto: telemetry handler raised ~a; ~
+                   silencing further telemetry errors~%" e))
+        nil))))
 
 (defun build-payload (adapter sql params start &optional condition)
   (let ((base (list :sql sql

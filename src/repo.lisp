@@ -91,21 +91,38 @@
       changes))
 
 (defun prepare-row (schema values action)
-  "Apply the persistence pipeline (strip metadata -> timestamps ->
-drop virtuals -> encode embeds) for ACTION (:insert or :update).
-Returns a fresh plist ready for SQL."
-  (encode-embeds schema
-                 (drop-virtual schema
-                               (ecase action
-                                 (:insert (stamp-insert schema
-                                          (strip-cs-metadata values)))
-                                 (:update (stamp-update schema
-                                          (strip-cs-metadata values)))))))
+  "Apply the persistence pipeline for ACTION (:insert or :update):
+strip changeset metadata -> add timestamps -> tag boolean false values
+with the :FALSE sentinel based on field type -> drop virtual fields ->
+encode embeds. Returns a fresh plist ready for SQL."
+  (encode-embeds
+   schema
+   (drop-virtual
+    schema
+    (encode-booleans
+     schema
+     (ecase action
+       (:insert (stamp-insert schema (strip-cs-metadata values)))
+       (:update (stamp-update schema (strip-cs-metadata values))))))))
 
 (defun strip-cs-metadata (values)
   "Drop changeset-side metadata (e.g. :__schema__) so it can't accidentally
 become a SQL column."
   (alexandria:remove-from-plist values :__schema__))
+
+(defun encode-booleans (schema values)
+  "For each boolean field present in VALUES with the value NIL, swap NIL
+for the :FALSE sentinel so adapter encoders can distinguish 'boolean
+false' from 'SQL NULL'. Non-boolean fields are untouched, so a stray
+:FALSE elsewhere is never auto-translated."
+  (let ((bool-fields (loop for f in (schema-fields schema)
+                           when (eq (field-type f) :boolean)
+                           collect (field-name f))))
+    (if (null bool-fields)
+        values
+        (loop for (k v) on values by #'cddr
+              collect k
+              collect (if (and (member k bool-fields) (null v)) :false v)))))
 
 (defun query-where-expr (q)
   "Collapse a query's accumulated wheres into a single expression (or NIL)."
@@ -151,24 +168,25 @@ ON-CONFLICT and CONFLICT-TARGET enable upsert; see INSERT-SQL."
                            :conflict-target target
                            :returning (when use-returning t))
              (let ((record
-                     (cond
-                       (use-returning
-                        ;; Adapter returns the inserted row (PG style).
-                        ;; If :on-conflict :nothing matched, RETURNING is
-                        ;; empty — treat as a benign no-op insert.
-                        (or (first (adapter-execute adapter sql params))
-                            (when (eq on-conflict :nothing)
-                              (return-from repo-insert (values nil nil)))
-                            (error "RETURNING produced no row")))
-                       (t
-                        ;; SQLite path: returning multi-values gives us
-                        ;; the last id atomically, no extra round-trip.
-                        (multiple-value-bind (changes last-id)
-                            (adapter-execute-returning adapter sql params)
-                          (declare (ignore changes))
-                          (let* ((pk (schema-primary-key schema))
-                                 (id (or (getf values pk) last-id)))
-                            (list* pk id values)))))))
+                     (with-telemetry (adapter sql params)
+                       (cond
+                         (use-returning
+                          ;; Adapter returns the inserted row (PG style).
+                          ;; If :on-conflict :nothing matched, RETURNING is
+                          ;; empty — treat as a benign no-op insert.
+                          (or (first (adapter-execute adapter sql params))
+                              (when (eq on-conflict :nothing)
+                                (return-from repo-insert (values nil nil)))
+                              (error "RETURNING produced no row")))
+                         (t
+                          ;; SQLite path: returning multi-values gives us
+                          ;; the last id atomically, no extra round-trip.
+                          (multiple-value-bind (changes last-id)
+                              (adapter-execute-returning adapter sql params)
+                            (declare (ignore changes))
+                            (let* ((pk (schema-primary-key schema))
+                                   (id (or (getf values pk) last-id)))
+                              (list* pk id values))))))))
                (values record nil))))))))
 
 (defun repo-update (repo cs)
@@ -186,7 +204,8 @@ ON-CONFLICT and CONFLICT-TARGET enable upsert; see INSERT-SQL."
            (unless id (error "repo-update: data is missing primary key ~a" pk))
            (multiple-value-bind (sql params)
                (update-sql (repo-adapter repo) table changes (list '= pk id))
-             (adapter-execute-returning (repo-adapter repo) sql params)
+             (with-telemetry ((repo-adapter repo) sql params)
+               (adapter-execute-returning (repo-adapter repo) sql params))
              (values (apply-changes (copy-cs cs :changes changes)) nil)))))))
 
 (defvar *repo-insert-all-row-cap* 1000
@@ -206,21 +225,35 @@ Returns the number of rows inserted. Caps at *repo-insert-all-row-cap*."
            (stamped (mapcar (lambda (r) (stamp-insert schema r)) rows)))
       (multiple-value-bind (sql params)
           (insert-all-sql (repo-adapter repo) table stamped)
-        (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params))))))
+        (with-telemetry ((repo-adapter repo) sql params)
+          (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params)))))))
 
-(defun repo-update-all (repo query set-plist)
-  "Bulk UPDATE rows matching QUERY with SET-PLIST. Returns rows affected."
+(defun repo-update-all (repo query set-plist &key all)
+  "Bulk UPDATE rows matching QUERY with SET-PLIST. Returns rows affected.
+
+A QUERY with no WHERE clause would update every row in the table; that
+is almost always a bug introduced by a missing WHERE-IF. Refuses unless
+ALL is non-nil — pass :ALL T to confirm you really mean every row."
+  (unless (or all (query-wheres query))
+    (error "repo-update-all refuses to touch every row.~@
+            Add a WHERE or pass :all t."))
   (multiple-value-bind (sql params)
       (update-sql (repo-adapter repo) (query-table query)
                   set-plist (query-where-expr query))
-    (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params))))
+    (with-telemetry ((repo-adapter repo) sql params)
+      (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params)))))
 
-(defun repo-delete-all (repo query)
-  "Bulk DELETE rows matching QUERY. Returns rows affected."
+(defun repo-delete-all (repo query &key all)
+  "Bulk DELETE rows matching QUERY. Returns rows affected. See
+REPO-UPDATE-ALL for the no-WHERE safety guard."
+  (unless (or all (query-wheres query))
+    (error "repo-delete-all refuses to delete every row.~@
+            Add a WHERE or pass :all t."))
   (multiple-value-bind (sql params)
       (delete-sql (repo-adapter repo) (query-table query)
                   (query-where-expr query))
-    (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params))))
+    (with-telemetry ((repo-adapter repo) sql params)
+      (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params)))))
 
 (defun repo-delete (repo schema-name id)
   (let* ((schema (find-schema schema-name))
@@ -228,7 +261,8 @@ Returns the number of rows inserted. Caps at *repo-insert-all-row-cap*."
          (pk     (schema-primary-key schema)))
     (multiple-value-bind (sql params)
         (delete-sql (repo-adapter repo) table (list '= pk id))
-      (adapter-execute-returning (repo-adapter repo) sql params))))
+      (with-telemetry ((repo-adapter repo) sql params)
+        (adapter-execute-returning (repo-adapter repo) sql params)))))
 
 ;;; --- preloading associations ---
 

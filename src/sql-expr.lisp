@@ -18,20 +18,29 @@
 (defun fragment-form-p (x)
   (and (consp x) (eq (car x) :fragment)))
 
+(defparameter *fragment-template-cap* 65536
+  "Maximum length accepted for a fragment template. Fragment templates
+are by contract developer constants — a 64 KB cap catches accidental
+threading of unbounded input.")
+
 (defun compile-fragment (st form)
   "Expand (:fragment \"sql with ? holes\" arg1 arg2 ...) — each ? is
 replaced by its arg compiled as an operand (column refs inline, other
 values become parameters)."
-  (let* ((tmpl (second form))
-         (args (cddr form))
-         (idx  0))
-    (with-output-to-string (s)
-      (loop for c across tmpl do
-        (cond
-          ((char= c #\?)
-           (write-string (compile-operand st (nth idx args)) s)
-           (incf idx))
-          (t (write-char c s)))))))
+  (let ((tmpl (second form)))
+    (check-type tmpl string)
+    (when (> (length tmpl) *fragment-template-cap*)
+      (error "fragment template length ~d exceeds *fragment-template-cap* (~d)"
+             (length tmpl) *fragment-template-cap*))
+    (let ((args (cddr form))
+          (idx  0))
+      (with-output-to-string (s)
+        (loop for c across tmpl do
+          (cond
+            ((char= c #\?)
+             (write-string (compile-operand st (nth idx args)) s)
+             (incf idx))
+            (t (write-char c s))))))))
 
 (defun compile-column-or-aggregate (st x)
   "Return SQL for a column ref, aggregate, or fragment. NIL if X is none."
@@ -76,11 +85,13 @@ values become parameters)."
                (format nil "~a IN (~a)"
                        (qi (sql-state-adapter st) col)
                        (emit-select st (subquery-query rhs))))
-              (t
+              ((listp rhs)
                (let ((placeholders (mapcar (lambda (v) (emit-param st v)) rhs)))
                  (format nil "~a IN (~{~a~^, ~})"
                          (qi (sql-state-adapter st) col)
-                         placeholders))))))
+                         placeholders)))
+              (t
+               (error "IN expects a list or subquery on the right, got: ~s" rhs)))))
          ((string= op-name "LIKE")
           (format nil "~a LIKE ~a"
                   (qi (sql-state-adapter st) (second expr))

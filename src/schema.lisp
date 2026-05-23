@@ -105,19 +105,39 @@ Association kinds: :has-many :has-one :belongs-to"
 ;;; --- type casting ---
 
 (defun now-naive-datetime ()
-  "Current local time as 'YYYY-MM-DD HH:MM:SS'."
+  "Current LOCAL time as 'YYYY-MM-DD HH:MM:SS' (no timezone). Matches
+Ecto's :naive_datetime convention; pair with :inserted-at/:updated-at."
   (multiple-value-bind (s m h d mo y) (decode-universal-time (get-universal-time))
     (format nil "~4,'0d-~2,'0d-~2,'0d ~2,'0d:~2,'0d:~2,'0d" y mo d h m s)))
 
+(defun now-utc-datetime ()
+  "Current UTC time as 'YYYY-MM-DD HH:MM:SSZ'. Use this for :utc-datetime
+fields and any cross-system audit timestamps."
+  (multiple-value-bind (s m h d mo y)
+      (decode-universal-time (get-universal-time) 0)
+    (format nil "~4,'0d-~2,'0d-~2,'0d ~2,'0d:~2,'0d:~2,'0dZ" y mo d h m s)))
+
+(define-condition secure-random-unavailable (error)
+  ((reason :initarg :reason :reader secure-random-reason))
+  (:report (lambda (c stream)
+             (format stream
+                     "OS CSPRNG (/dev/urandom) is unavailable: ~a.~@
+                      generate-uuid and generate-secure-token require ~
+                      a working CSPRNG; do NOT fall back to anything else."
+                     (secure-random-reason c)))))
+
 (defun read-secure-bytes (n)
-  "Read N bytes from the OS CSPRNG (/dev/urandom). Errors if the device
-isn't available — DO NOT silently fall back to PRNG since this function
-is used for security-sensitive UUIDs / tokens."
-  (with-open-file (s "/dev/urandom"
-                     :direction :input
-                     :element-type '(unsigned-byte 8)
-                     :if-does-not-exist :error)
-    (loop repeat n collect (read-byte s))))
+  "Read N bytes from the OS CSPRNG (/dev/urandom). Signals
+SECURE-RANDOM-UNAVAILABLE if the device can't be opened — do NOT catch
+this and silently fall back to a PRNG."
+  (handler-case
+      (with-open-file (s "/dev/urandom"
+                         :direction :input
+                         :element-type '(unsigned-byte 8)
+                         :if-does-not-exist :error)
+        (loop repeat n collect (read-byte s)))
+    (file-error (e) (error 'secure-random-unavailable :reason e))
+    (stream-error (e) (error 'secure-random-unavailable :reason e))))
 
 (defun generate-uuid ()
   "RFC 4122 v4 UUID. Bytes come from the OS CSPRNG so the result is safe
@@ -138,13 +158,23 @@ identifiers."
 (defun field-virtual-p (field)
   (getf (field-options field) :virtual))
 
+(defparameter *numeric-string-cap* 64
+  "Maximum length of a string accepted by SAFE-PARSE-NUMBER /
+SAFE-PARSE-RATIONAL / :integer casting. Caps the cost of an attacker
+sending megabyte-long digit strings that would build huge bignums.")
+
+(defparameter *numeric-exponent-cap* 1000
+  "Maximum |exponent| accepted in scientific notation. (expt 10 1000) is
+already a very large bignum; anything beyond is a DoS in disguise.")
+
 (defun safe-parse-number (s)
   "Parse a base-10 numeric literal directly from S without invoking the
 Lisp reader. Accepts integers, decimals, and scientific notation. Returns
 (values number ok-p)."
   (let* ((s (string-trim '(#\Space #\Tab) s))
          (len (length s)))
-    (when (zerop len) (return-from safe-parse-number (values nil nil)))
+    (when (or (zerop len) (> len *numeric-string-cap*))
+      (return-from safe-parse-number (values nil nil)))
     (block out
       (let ((i 0) (sign 1) (int 0) (frac 0) (frac-div 1)
             (exp 0) (exp-sign 1)
@@ -177,6 +207,8 @@ Lisp reader. Accepts integers, decimals, and scientific notation. Returns
               (incf i))
             (unless saw-exp-digit (return-from out (values nil nil)))))
         (unless (= i len) (return-from out (values nil nil)))
+        (when (> exp *numeric-exponent-cap*)
+          (return-from out (values nil nil)))
         (let ((mag (+ int (/ frac frac-div))))
           (when (= exp-sign -1) (setf exp (- exp)))
           (setf mag (* sign mag (expt 10 exp)))
@@ -202,8 +234,11 @@ Lisp reader. Accepts integers, decimals, and scientific notation. Returns
     ((eq type :integer)
      (typecase value
        (integer (values value t))
-       (string (let ((n (ignore-errors (parse-integer value :junk-allowed nil))))
-                 (if n (values n t) (values nil nil))))
+       (string
+        (if (> (length value) *numeric-string-cap*)
+            (values nil nil)
+            (let ((n (ignore-errors (parse-integer value :junk-allowed nil))))
+              (if n (values n t) (values nil nil)))))
        (t (values nil nil))))
     ((eq type :float)
      (typecase value
@@ -222,12 +257,14 @@ Lisp reader. Accepts integers, decimals, and scientific notation. Returns
        (string (values value t))
        (t      (values (princ-to-string value) t))))
     ((eq type :boolean)
+     ;; Cast keeps boolean values as plain T/NIL — the :FALSE sentinel
+     ;; needed by adapters is only introduced later in PREPARE-ROW, where
+     ;; we have field-type context. That avoids :FALSE ever appearing in
+     ;; non-boolean fields by accident.
      (cond ((member value '(t :true "true" "t" 1) :test #'equal)
             (values t t))
-           ;; NIL casts to the explicit :FALSE sentinel so adapters can
-           ;; distinguish "boolean false" from "value not provided".
            ((member value '(nil :false "false" "f" 0) :test #'equal)
-            (values :false t))
+            (values nil t))
            (t (values nil nil))))
     ((or (eq type :utc-datetime)
          (eq type :naive-datetime)

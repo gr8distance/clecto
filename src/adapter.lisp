@@ -55,14 +55,15 @@ to keep keyword interning under control on hot query paths."
 (defun identifier-word-match-p (needle haystack)
   "T iff NEEDLE appears in HAYSTACK with non-identifier chars (or string
 boundaries) on both sides. Lets us match \"email\" without also
-matching it inside \"customer_email\"."
-  (let ((pos (search needle haystack)))
-    (when pos
-      (and (or (zerop pos)
-               (not (identifier-char-p (char haystack (1- pos)))))
-           (let ((end (+ pos (length needle))))
-             (or (= end (length haystack))
-                 (not (identifier-char-p (char haystack end)))))))))
+matching it inside \"customer_email\". An empty NEEDLE never matches."
+  (when (plusp (length needle))
+    (let ((pos (search needle haystack)))
+      (when pos
+        (and (or (zerop pos)
+                 (not (identifier-char-p (char haystack (1- pos)))))
+             (let ((end (+ pos (length needle))))
+               (or (= end (length haystack))
+                   (not (identifier-char-p (char haystack end))))))))))
 
 (defun escape-identifier-body (s)
   "Escape the inside of a double-quoted SQL identifier: \"\"\"\" doubles the

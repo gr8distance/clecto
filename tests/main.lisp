@@ -186,13 +186,97 @@
       (declare (ignore params))
       (is (search "RETURNING \"id\", \"email\"" sql)))))
 
+;;; --- second-pass audit fixes ---
+
+(test safe-parse-number-caps-input
+  ;; Big exponent rejected, doesn't compute (expt 10 9999999999)
+  (is (null (nth-value 1 (clecto::safe-parse-number "1e9999999999"))))
+  ;; Megabyte-long digit strings rejected without parse-integer running
+  (is (null (nth-value 1 (clecto::safe-parse-number
+                          (make-string 100000 :initial-element #\1))))))
+
+(test integer-cast-caps-input
+  (is (null (nth-value 1 (clecto::cast-value
+                          (make-string 100000 :initial-element #\1)
+                          :integer)))))
+
+(defschema bool-row "bool_t"
+  (:id   :integer :primary-key t)
+  (:flag :boolean))
+
+(test boolean-false-sentinel-only-for-boolean-fields
+  ;; encode-booleans tags nil-for-boolean with :false, leaves others alone
+  (let ((schema (find-schema 'bool-row)))
+    (is (eq :false (getf (clecto::encode-booleans schema '(:flag nil)) :flag)))
+    (is (eq nil (getf (clecto::encode-booleans schema '(:other nil)) :other)))))
+
+(test boolean-roundtrip-distinguishes-false-from-null
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE bool_t (id INTEGER PRIMARY KEY, flag INTEGER)")
+           (repo-insert r (cast 'bool-row '(:flag t) '(:flag)))
+           (repo-insert r (cast 'bool-row '(:flag nil) '(:flag)))
+           (let ((rows (repo-all r (from :bool-t))))
+             (is (= 1 (getf (first rows) :flag)))   ; true -> 1
+             (is (= 0 (getf (second rows) :flag))))) ; false -> 0, not NULL
+      (sqlite-close a))))
+
+(test mutations-fire-telemetry
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a))
+         (events nil)
+         (clecto:*telemetry* (lambda (event payload)
+                               (declare (ignore payload))
+                               (push event events))))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE m (id INTEGER PRIMARY KEY, n INTEGER)")
+           (defschema m-row "m" (:id :integer :primary-key t) (:n :integer))
+           (repo-insert r (cast 'm-row '(:n 1) '(:n)))
+           (repo-insert-all r 'm-row '((:n 2) (:n 3)))
+           (repo-delete r 'm-row 1)
+           ;; we should have seen multiple :query events
+           (is (>= (count :query events) 3)))
+      (sqlite-close a))))
+
+(test identifier-word-match-rejects-empty-needle
+  (is (not (clecto::identifier-word-match-p "" "anything"))))
+
+;;; --- v0.2 LOW guards ---
+
+(test fragment-template-cap
+  (let ((huge (make-string 100000 :initial-element #\x)))
+    (signals error
+      (clecto::compile-fragment
+       (clecto::make-sql-state :adapter (make-instance 'mock-pg-adapter))
+       (list :fragment huge)))))
+
+(test in-rejects-non-list-rhs
+  (let ((a (make-instance 'mock-pg-adapter)))
+    (signals error
+      (clecto::select-sql a (where (from :users) '(in :id "not-a-list"))))))
+
+(test bulk-update-delete-refuses-no-where
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE x (id INTEGER PRIMARY KEY)")
+           (signals error (repo-update-all r (from :x) '(:id 0)))
+           (signals error (repo-delete-all r (from :x)))
+           ;; explicit :all t allowed
+           (is (zerop (repo-delete-all r (from :x) :all t))))
+      (sqlite-close a))))
+
 ;;; --- v0.2 security/correctness hardening ---
 
 (test secure-uuid-uses-csprng
   (let ((u (generate-uuid)))
     (is (= 36 (length u)))
     (is (char= #\4 (char u 14)))            ; version 4
-    (is (member (char u 19) '(#\8 #\9 #\a #\b))))  ; variant 1
+    (is (member (char u 19) '(#\8 #\9 #\A #\B))))  ; variant 1 (uppercase from ~X)
   (is (= 64 (length (generate-secure-token :byte-length 32)))))
 
 (test telemetry-omits-params-by-default

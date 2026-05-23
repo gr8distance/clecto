@@ -11,7 +11,9 @@
    #:association
    #:association-name #:association-kind
    #:association-target #:association-foreign-key
-   #:now-naive-datetime #:generate-uuid #:generate-secure-token)
+   #:now-naive-datetime #:now-utc-datetime
+   #:generate-uuid #:generate-secure-token
+   #:secure-random-unavailable)
 
   ;; --- changeset ---
   (:export

@@ -3,11 +3,15 @@
 An Ecto-flavored, immutable, functional data layer for Common Lisp.
 
 `clecto` is the data layer companion to [clug](https://github.com/gr8distance/clug).
-The goal is the same: a small stack of pure functions you compose into
-something the size of Phoenix, without any of the magic.
+It only covers the ORM concerns Ecto covers — schema, changeset, query,
+repo, adapter — and aims to do so with a small surface of pure functions.
 
 > **Values are immutable. Plugs are functions. The repo is the only thing
 > that touches I/O.**
+
+It is **not** a Phoenix port: no LiveView, no PubSub, no Mailer, no
+asset pipeline. clecto + clug is more like Plug + Ecto than like
+Phoenix itself.
 
 ---
 
