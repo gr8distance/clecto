@@ -88,6 +88,22 @@
              (alexandria:remove-from-plist changes :updated-at))
       changes))
 
+(defun prepare-row (schema values action)
+  "Apply the persistence pipeline (timestamps -> drop virtuals -> encode embeds)
+for ACTION (:insert or :update). Returns a fresh plist ready for SQL."
+  (encode-embeds schema
+                 (drop-virtual schema
+                               (ecase action
+                                 (:insert (stamp-insert schema values))
+                                 (:update (stamp-update schema values))))))
+
+(defun query-where-expr (q)
+  "Collapse a query's accumulated wheres into a single expression (or NIL)."
+  (let ((ws (query-wheres q)))
+    (cond ((null ws) nil)
+          ((null (cdr ws)) (car ws))
+          (t (cons 'and ws)))))
+
 (defun catch-constraint-error (adapter cs thunk)
   "Run THUNK. If it signals a DB error matching a constraint declared on CS,
 return (values nil cs-with-error). Otherwise propagate."
@@ -111,9 +127,7 @@ ON-CONFLICT and CONFLICT-TARGET enable upsert; see INSERT-SQL."
        (lambda ()
          (let* ((schema (find-schema (cs-schema cs)))
                 (table  (intern-table schema))
-                (values (encode-embeds schema
-                                       (drop-virtual schema
-                                                     (stamp-insert schema (apply-changes cs)))))
+                (values (prepare-row schema (apply-changes cs) :insert))
                 (target (or conflict-target
                             (and on-conflict (schema-primary-key schema)))))
            (multiple-value-bind (sql params)
@@ -138,14 +152,12 @@ ON-CONFLICT and CONFLICT-TARGET enable upsert; see INSERT-SQL."
                 (table   (intern-table schema))
                 (pk      (schema-primary-key schema))
                 (id      (getf (cs-data cs) pk))
-                (changes (encode-embeds schema
-                                        (drop-virtual schema
-                                                      (stamp-update schema (cs-changes cs))))))
+                (changes (prepare-row schema (cs-changes cs) :update)))
            (unless id (error "repo-update: data is missing primary key ~a" pk))
            (multiple-value-bind (sql params)
                (update-sql (repo-adapter repo) table changes (list '= pk id))
              (adapter-execute-returning (repo-adapter repo) sql params)
-             (values (append changes (cs-data cs)) nil)))))))
+             (values (apply-changes (copy-cs cs :changes changes)) nil)))))))
 
 (defun repo-insert-all (repo schema-name rows)
   "Bulk insert ROWS (a list of plists). Auto-stamps timestamps when enabled.
@@ -153,39 +165,24 @@ Returns the number of rows inserted."
   (when rows
     (let* ((schema (find-schema schema-name))
            (table  (intern-table schema))
-           (stamped (if (schema-timestamps-p schema)
-                        (let ((now (now-naive-datetime)))
-                          (mapcar (lambda (r)
-                                    (list* :inserted-at now :updated-at now
-                                           (alexandria:remove-from-plist
-                                            r :inserted-at :updated-at)))
-                                  rows))
-                        rows)))
+           (stamped (mapcar (lambda (r) (stamp-insert schema r)) rows)))
       (multiple-value-bind (sql params)
           (insert-all-sql (repo-adapter repo) table stamped)
         (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params))))))
 
 (defun repo-update-all (repo query set-plist)
   "Bulk UPDATE rows matching QUERY with SET-PLIST. Returns rows affected."
-  (let* ((table (query-table query))
-         (where (when (query-wheres query)
-                  (if (= 1 (length (query-wheres query)))
-                      (first (query-wheres query))
-                      (cons 'and (query-wheres query))))))
-    (multiple-value-bind (sql params)
-        (update-sql (repo-adapter repo) table set-plist where)
-      (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params)))))
+  (multiple-value-bind (sql params)
+      (update-sql (repo-adapter repo) (query-table query)
+                  set-plist (query-where-expr query))
+    (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params))))
 
 (defun repo-delete-all (repo query)
   "Bulk DELETE rows matching QUERY. Returns rows affected."
-  (let* ((table (query-table query))
-         (where (when (query-wheres query)
-                  (if (= 1 (length (query-wheres query)))
-                      (first (query-wheres query))
-                      (cons 'and (query-wheres query))))))
-    (multiple-value-bind (sql params)
-        (delete-sql (repo-adapter repo) table where)
-      (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params)))))
+  (multiple-value-bind (sql params)
+      (delete-sql (repo-adapter repo) (query-table query)
+                  (query-where-expr query))
+    (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params))))
 
 (defun repo-delete (repo schema-name id)
   (let* ((schema (find-schema schema-name))

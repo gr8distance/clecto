@@ -6,14 +6,19 @@
   :depends-on ("alexandria" "sqlite" "jonathan")
   :pathname "src/"
   :components ((:file "package")
+               (:file "util"       :depends-on ("package"))
                (:file "schema"     :depends-on ("package"))
-               (:file "changeset"  :depends-on ("schema"))
-               (:file "query"      :depends-on ("package"))
+               (:file "changeset"  :depends-on ("schema" "util"))
+               (:file "query"      :depends-on ("package" "util"))
                (:file "adapter"    :depends-on ("package"))
-               (:file "sql"        :depends-on ("query" "adapter"))
-               (:module "adapters" :depends-on ("adapter" "sql")
+               (:file "sql"          :depends-on ("query" "adapter"))
+               (:file "sql-expr"     :depends-on ("sql"))
+               (:file "sql-select"   :depends-on ("sql-expr"))
+               (:file "sql-mutation" :depends-on ("sql-expr"))
+               (:module "adapters" :depends-on ("adapter" "sql-select" "sql-mutation")
                 :components ((:file "sqlite")))
-               (:file "repo"       :depends-on ("adapter" "sql" "changeset" "schema")))
+               (:file "repo"       :depends-on ("adapter" "sql-select" "sql-mutation"
+                                                "changeset" "schema")))
   :in-order-to ((test-op (test-op "clecto/tests"))))
 
 (defsystem "clecto/tests"

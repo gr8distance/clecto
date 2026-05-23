@@ -3,12 +3,14 @@
 ;;; Changeset: immutable value that flows through validation plugs.
 ;;; All operations return a fresh changeset — the data never mutates.
 
-(defstruct changeset
+(defstruct (changeset
+            (:conc-name cs-)
+            (:predicate changeset-p))
   (schema      nil :type (or null symbol))
-  (data        nil :type list)   ; plist: existing record
-  (changes     nil :type list)   ; plist: proposed changes
-  (errors      nil :type list)   ; alist: ((field . message) ...)
-  (constraints nil :type list)   ; list of CONSTRAINT
+  (data        nil :type list)
+  (changes     nil :type list)
+  (errors      nil :type list)
+  (constraints nil :type list)
   (action      nil :type symbol) ; nil, :insert, :update, :delete, :ignore
   (valid-p     t   :type boolean))
 
@@ -18,24 +20,10 @@
   (field   nil :type keyword)   ; cs field to attach the error to
   (message nil :type string))
 
-(defun copy-cs (cs &rest overrides)
-  (let ((c (copy-changeset cs)))
-    (loop for (slot val) on overrides by #'cddr do
-      (ecase slot
-        (:schema      (setf (changeset-schema c) val))
-        (:data        (setf (changeset-data c) val))
-        (:changes     (setf (changeset-changes c) val))
-        (:errors      (setf (changeset-errors c) val))
-        (:constraints (setf (changeset-constraints c) val))
-        (:action      (setf (changeset-action c) val))
-        (:valid-p     (setf (changeset-valid-p c) val))))
-    c))
-
-(defun cs-data    (cs) (changeset-data cs))
-(defun cs-changes (cs) (changeset-changes cs))
-(defun cs-errors  (cs) (changeset-errors cs))
-(defun cs-valid-p (cs) (changeset-valid-p cs))
-(defun cs-schema  (cs) (changeset-schema cs))
+(define-copier copy-cs
+  :copier copy-changeset
+  :accessor-prefix cs-
+  :slots (schema data changes errors constraints action valid-p))
 
 (defun cast (data-or-schema attrs allowed)
   "Begin a changeset. DATA-OR-SCHEMA is either a schema symbol (insert)
@@ -170,9 +158,6 @@ Sufficient for email-ish '@' checks without pulling in a regex lib."
              (or (null =)  (cl:=  v =)))
         cs
         (add-error cs field message))))
-
-(defun cs-constraints (cs) (changeset-constraints cs))
-(defun cs-action      (cs) (changeset-action cs))
 
 (defun traverse-errors (cs &optional (fn (lambda (field msg)
                                            (declare (ignore field))

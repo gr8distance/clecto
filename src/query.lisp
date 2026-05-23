@@ -38,25 +38,11 @@
   (limit   nil)
   (offset  nil))
 
-(defun copy-q (q &rest overrides)
-  (let ((c (copy-query q)))
-    (loop for (slot val) on overrides by #'cddr do
-      (ecase slot
-        (:ctes    (setf (query-ctes c) val))
-        (:table   (setf (query-table c) val))
-        (:wheres  (setf (query-wheres c) val))
-        (:selects (setf (query-selects c) val))
-        (:orders  (setf (query-orders c) val))
-        (:joins   (setf (query-joins c) val))
-        (:groups  (setf (query-groups c) val))
-        (:havings (setf (query-havings c) val))
-        (:distinct (setf (query-distinct c) val))
-        (:combinators (setf (query-combinators c) val))
-        (:lock    (setf (query-lock c) val))
-        (:prefix  (setf (query-prefix c) val))
-        (:limit   (setf (query-limit c) val))
-        (:offset  (setf (query-offset c) val))))
-    c))
+(define-copier copy-q
+  :copier copy-query
+  :accessor-prefix query-
+  :slots (ctes table wheres selects orders joins groups havings
+          distinct combinators lock prefix limit offset))
 
 (defun from (table)
   (make-query :table table))
