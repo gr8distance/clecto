@@ -15,8 +15,9 @@
   (valid-p     t   :type boolean))
 
 (defstruct constraint
-  (kind    nil :type keyword)   ; :unique :foreign-key
+  (kind    nil :type keyword)   ; :unique :foreign-key :check
   (column  nil)                 ; column name for matching (string or keyword)
+  (name    nil)                 ; DB-side constraint name (PG / explicit)
   (field   nil :type keyword)   ; cs field to attach the error to
   (message nil :type string))
 
@@ -182,21 +183,40 @@ ACTION is typically :insert, :update, or :delete."
       (values (apply-changes cs) nil)
       (values nil (copy-cs cs :action action))))
 
-(defun unique-constraint (cs field &key (message "has already been taken") column)
+(defun unique-constraint (cs field
+                          &key (message "has already been taken") column name)
   "Declare that a UNIQUE violation on COLUMN (defaults to FIELD) should
-appear as an error on FIELD when the next repo-insert/update fails."
+appear as an error on FIELD when the next repo-insert/update fails.
+NAME is the DB-side constraint name (e.g. \"users_email_key\"); useful
+when the column name doesn't match the index name."
   (copy-cs cs
            :constraints
            (cons (make-constraint :kind :unique
                                   :column (or column field)
+                                  :name name
                                   :field field
                                   :message message)
                  (cs-constraints cs))))
 
-(defun foreign-key-constraint (cs field &key (message "does not exist"))
+(defun foreign-key-constraint (cs field
+                               &key (message "does not exist") name)
   (copy-cs cs
            :constraints
-           (cons (make-constraint :kind :foreign-key :field field :message message)
+           (cons (make-constraint :kind :foreign-key
+                                  :name name
+                                  :field field
+                                  :message message)
+                 (cs-constraints cs))))
+
+(defun check-constraint (cs field
+                         &key (message "is invalid") name)
+  "DB-level CHECK constraints (PG)."
+  (copy-cs cs
+           :constraints
+           (cons (make-constraint :kind :check
+                                  :name name
+                                  :field field
+                                  :message message)
                  (cs-constraints cs))))
 
 (defun validate-inclusion (cs field allowed &key (message "is not included in the list"))

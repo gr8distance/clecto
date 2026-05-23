@@ -25,7 +25,7 @@
    #:validate-confirmation #:validate-acceptance
    #:traverse-errors #:apply-action
    #:cast-embed #:cast-assoc
-   #:unique-constraint #:foreign-key-constraint)
+   #:unique-constraint #:foreign-key-constraint #:check-constraint)
 
   ;; --- query ---
   (:export
@@ -50,9 +50,13 @@
   ;; --- sql ---
   (:export #:to-sql)
 
+  ;; --- telemetry ---
+  (:export #:*telemetry*)
+
   ;; --- adapters ---
   (:export
-   #:sqlite-adapter #:make-sqlite-adapter #:sqlite-close)
+   #:sqlite-adapter #:make-sqlite-adapter #:sqlite-close
+   #:postgres-adapter #:make-postgres-adapter #:postgres-close)
 
   ;; --- repo ---
   (:export

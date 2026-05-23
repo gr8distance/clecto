@@ -13,8 +13,10 @@
 
 (defun repo-all (repo query)
   "Run QUERY, return all rows as plists."
-  (multiple-value-bind (sql params) (select-sql (repo-adapter repo) query)
-    (adapter-execute (repo-adapter repo) sql params)))
+  (let ((adapter (repo-adapter repo)))
+    (multiple-value-bind (sql params) (select-sql adapter query)
+      (with-telemetry (adapter sql params)
+        (adapter-execute adapter sql params)))))
 
 (defun repo-one (repo query)
   "Return the first row (or NIL). LIMIT 1 is applied if not set."
@@ -125,20 +127,30 @@ ON-CONFLICT and CONFLICT-TARGET enable upsert; see INSERT-SQL."
       (catch-constraint-error
        (repo-adapter repo) cs
        (lambda ()
-         (let* ((schema (find-schema (cs-schema cs)))
-                (table  (intern-table schema))
-                (values (prepare-row schema (apply-changes cs) :insert))
-                (target (or conflict-target
-                            (and on-conflict (schema-primary-key schema)))))
+         (let* ((adapter (repo-adapter repo))
+                (schema  (find-schema (cs-schema cs)))
+                (table   (intern-table schema))
+                (values  (prepare-row schema (apply-changes cs) :insert))
+                (target  (or conflict-target
+                             (and on-conflict (schema-primary-key schema))))
+                (use-returning (adapter-supports-returning-p adapter)))
            (multiple-value-bind (sql params)
-               (insert-sql (repo-adapter repo) table values
+               (insert-sql adapter table values
                            :on-conflict on-conflict
-                           :conflict-target target)
-             (adapter-execute-returning (repo-adapter repo) sql params)
-             (let* ((pk (schema-primary-key schema))
-                    (id (or (getf values pk)
-                            (adapter-last-insert-id (repo-adapter repo))))
-                    (record (list* pk id values)))
+                           :conflict-target target
+                           :returning (when use-returning t))
+             (let ((record
+                     (cond
+                       (use-returning
+                        ;; Adapter returns the inserted row (PG style).
+                        (or (first (adapter-execute adapter sql params))
+                            (error "RETURNING produced no row")))
+                       (t
+                        (adapter-execute-returning adapter sql params)
+                        (let* ((pk (schema-primary-key schema))
+                               (id (or (getf values pk)
+                                       (adapter-last-insert-id adapter))))
+                          (list* pk id values))))))
                (values record nil))))))))
 
 (defun repo-update (repo cs)
@@ -308,4 +320,6 @@ condition also rolls back and is re-raised."
 ;;; --- escape hatch for raw SQL / migrations ---
 
 (defun repo-execute (repo sql &optional params)
-  (adapter-execute (repo-adapter repo) sql params))
+  (let ((adapter (repo-adapter repo)))
+    (with-telemetry (adapter sql params)
+      (adapter-execute adapter sql params))))

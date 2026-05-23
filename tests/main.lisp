@@ -122,6 +122,70 @@
            (is (= 1 (length (repo-all r (from :users))))))
       (sqlite-close a))))
 
+;;; --- telemetry ---
+
+(defschema tel-row "tel"
+  (:id :integer :primary-key t)
+  (:n  :integer))
+
+(test telemetry-fires-on-query
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a))
+         (events nil)
+         (clecto:*telemetry*
+           (lambda (event payload)
+             (push (list event (getf payload :sql)) events))))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE tel (id INTEGER PRIMARY KEY, n INTEGER)")
+           (repo-insert r (cast 'tel-row '(:n 1) '(:n)))
+           (repo-all r (from :tel))
+           (is (some (lambda (e) (eq (first e) :query)) events))
+           (is (some (lambda (e) (search "SELECT" (second e))) events)))
+      (sqlite-close a))))
+
+(test telemetry-fires-on-error
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a))
+         (events nil)
+         (clecto:*telemetry*
+           (lambda (event payload) (push (list event payload) events))))
+    (unwind-protect
+         (signals error (repo-execute r "SELECT bogus FROM nope"))
+      (sqlite-close a))
+    (is (some (lambda (e) (eq (first e) :error)) events))))
+
+;;; --- postgres adapter SQL emission (no live DB required) ---
+
+(defclass mock-pg-adapter (clecto:adapter) ())
+(defmethod adapter-quote-identifier ((a mock-pg-adapter) name)
+  (multiple-value-bind (q c) (clecto::split-qualified name)
+    (if q (format nil "\"~a\".\"~a\""
+                  (clecto::escape-identifier-body q)
+                  (clecto::escape-identifier-body c))
+          (format nil "\"~a\"" (clecto::escape-identifier-body c)))))
+(defmethod adapter-placeholder ((a mock-pg-adapter) index)
+  (format nil "$~a" index))
+(defmethod adapter-supports-returning-p ((a mock-pg-adapter)) t)
+
+(test postgres-style-placeholders-and-returning
+  (let ((a (make-instance 'mock-pg-adapter)))
+    ;; placeholders are $N
+    (multiple-value-bind (sql params)
+        (clecto::select-sql a (where (from :users) '(= :id 1)))
+      (is (search "\"id\" = $1" sql))
+      (is (equal '(1) params)))
+    ;; insert with RETURNING is emitted
+    (multiple-value-bind (sql params)
+        (clecto::insert-sql a :users '(:email "a@b") :returning t)
+      (declare (ignore params))
+      (is (search "RETURNING *" sql)))
+    ;; RETURNING with explicit columns
+    (multiple-value-bind (sql params)
+        (clecto::insert-sql a :users '(:email "a@b") :returning '(:id :email))
+      (declare (ignore params))
+      (is (search "RETURNING \"id\", \"email\"" sql)))))
+
 ;;; --- security guards ---
 
 (test safe-number-parsing-rejects-reader-injection

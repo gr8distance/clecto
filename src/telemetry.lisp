@@ -1,0 +1,45 @@
+(in-package #:clecto)
+
+;;; Lightweight telemetry. Set *telemetry* to a function of (event payload).
+;;; The repo emits :query and :error events around adapter-execute calls.
+;;;
+;;; Payload plist keys:
+;;;   :sql      string
+;;;   :params   list
+;;;   :duration seconds (real number)
+;;;   :rows     number of rows returned / affected (when applicable)
+;;;   :adapter  the adapter that ran the query
+;;;   :condition (only on :error)
+;;;
+;;; Users plug in logging / metrics / tracing without us picking a backend.
+
+(defvar *telemetry* nil
+  "Function (event payload) called around adapter-execute. NIL to disable.")
+
+(defun emit-event (event payload)
+  (when *telemetry*
+    (handler-case (funcall *telemetry* event payload)
+      (error () nil))))    ; never let telemetry break the call site
+
+(defmacro with-telemetry ((adapter sql params) &body body)
+  "Wrap BODY (an adapter-execute call) with telemetry events."
+  (let ((start (gensym))
+        (result (gensym))
+        (cond-sym (gensym)))
+    `(let ((,start (get-internal-real-time)))
+       (handler-case
+           (let ((,result (progn ,@body)))
+             (emit-event :query
+                         (list :sql ,sql :params ,params
+                               :duration (/ (- (get-internal-real-time) ,start)
+                                            internal-time-units-per-second)
+                               :adapter ,adapter))
+             ,result)
+         (error (,cond-sym)
+           (emit-event :error
+                       (list :sql ,sql :params ,params
+                             :duration (/ (- (get-internal-real-time) ,start)
+                                          internal-time-units-per-second)
+                             :adapter ,adapter
+                             :condition ,cond-sym))
+           (error ,cond-sym))))))

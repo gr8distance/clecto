@@ -3,24 +3,38 @@
 ;;; Mutation compilers: INSERT (with ON CONFLICT), INSERT...VALUES (multi),
 ;;; UPDATE, DELETE.
 
-(defun insert-sql (adapter table values-plist &key on-conflict conflict-target)
+(defun insert-sql (adapter table values-plist
+                   &key on-conflict conflict-target returning)
   "Optional ON-CONFLICT modes:
   :nothing         -> ON CONFLICT DO NOTHING
   :replace         -> ON CONFLICT DO UPDATE SET (all cols)
   (:replace COLS)  -> ON CONFLICT DO UPDATE SET (listed cols)
-CONFLICT-TARGET is a column keyword or list of keywords (defaults to PK column)."
+CONFLICT-TARGET is a column keyword or list of keywords (defaults to PK column).
+RETURNING is a column keyword, list of keywords, or T (for *) — adapters
+that support it (Postgres) get a RETURNING clause appended."
   (let* ((st (make-sql-state :adapter adapter))
          (cols (loop for (k v) on values-plist by #'cddr collect k))
          (vals (loop for (k v) on values-plist by #'cddr collect v))
          (placeholders (mapcar (lambda (v) (emit-param st v)) vals))
          (conflict-sql (when on-conflict
                          (render-conflict adapter on-conflict conflict-target cols)))
-         (sql (format nil "INSERT INTO ~a (~{~a~^, ~}) VALUES (~{~a~^, ~})~@[~a~]"
+         (returning-sql (when returning (render-returning adapter returning)))
+         (sql (format nil "INSERT INTO ~a (~{~a~^, ~}) VALUES (~{~a~^, ~})~@[~a~]~@[~a~]"
                       (qi adapter table)
                       (mapcar (lambda (c) (qi adapter c)) cols)
                       placeholders
-                      conflict-sql)))
+                      conflict-sql
+                      returning-sql)))
     (values sql (nreverse (sql-state-params st)))))
+
+(defun render-returning (adapter spec)
+  (cond
+    ((eq spec t) " RETURNING *")
+    ((keywordp spec) (format nil " RETURNING ~a" (qi adapter spec)))
+    ((consp spec)
+     (format nil " RETURNING ~{~a~^, ~}"
+             (mapcar (lambda (c) (qi adapter c)) spec)))
+    (t (error "Bad :returning spec ~a" spec))))
 
 (defun render-conflict (adapter on-conflict target all-cols)
   (let ((target-sql
