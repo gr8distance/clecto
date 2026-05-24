@@ -343,6 +343,26 @@ Run arbitrary SQL with parameter binding. Useful for:
 - Migrations bootstrapping (when not using an external migration
   tool)
 
+> ⚠️ **`repo-execute` is an UNPARAMETERISED ESCAPE HATCH** — the
+> SQL string is sent to the adapter unchanged. Use PARAMS for
+> every dynamic value:
+>
+> ```lisp
+> ;; GOOD:
+> (repo-execute *repo*
+>               "SELECT * FROM users WHERE id = ?"
+>               (list user-id))
+>
+> ;; BAD (SQL injection):
+> (repo-execute *repo*
+>               (format nil "SELECT * FROM users WHERE id = ~a"
+>                       user-id))
+> ```
+>
+> There is no smart string parser between this call and the
+> adapter — anything you splice into the SQL string is executed
+> verbatim. Never thread user input there; bind via PARAMS.
+
 ```lisp
 (repo-execute *repo*
   "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, age INTEGER,

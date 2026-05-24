@@ -30,12 +30,36 @@
     (repo-one repo
               (where (from (intern-table schema)) (list '= pk id)))))
 
-(defun repo-get-by (repo schema-name filters)
-  "Fetch the first row matching FILTERS (a plist of field/value pairs)."
-  (let* ((table (intern-table (find-schema schema-name)))
+(defun repo-get-by (repo schema-name filters &key allowed-keys)
+  "Fetch the first row of SCHEMA-NAME matching FILTERS (a plist of
+field/value pairs).
+
+FILTERS keys are gated against the schema's declared fields before
+being compiled into a WHERE clause. Any key that isn't a declared
+field signals an error — a defense against mass-assignment-style
+bugs where an attacker-controlled plist (e.g. raw HTTP query params)
+gets threaded into the filter map and is used to probe arbitrary
+columns like :password-hash.
+
+Pass ALLOWED-KEYS to narrow further: a caller-supplied list of
+field keywords that the filter is restricted to. Useful when a
+single endpoint exposes only a subset of the schema:
+
+  (repo-get-by repo 'user attrs :allowed-keys '(:email :public-id))
+
+When ALLOWED-KEYS is unset, every declared field on the schema is
+acceptable."
+  (let* ((schema (find-schema schema-name))
+         (declared (mapcar #'field-name (schema-fields schema)))
+         (whitelist (or allowed-keys declared))
+         (table (intern-table schema))
          (q (from table)))
     (loop for (k v) on filters by #'cddr
-          do (setf q (where q (list '= k v))))
+          do (unless (member k whitelist)
+               (error "repo-get-by: ~a is not in the allowed filter ~
+                       keys for schema ~a (declared: ~a)"
+                      k schema-name declared))
+             (setf q (where q (list '= k v))))
     (repo-one repo q)))
 
 (defun repo-exists-p (repo query)
@@ -227,15 +251,42 @@ Returns the number of rows inserted. Caps at *repo-insert-all-row-cap*."
         (with-telemetry ((repo-adapter repo) sql params)
           (nth-value 0 (adapter-execute-returning (repo-adapter repo) sql params)))))))
 
+(defun tautological-where-p (expr)
+  "T when EXPR is a where-clause that matches every row regardless
+of input. Used by the bulk mutation guards to refuse a query that
+*looks* filtered but is actually a no-op like (where q t) or
+(where q '(= 1 1)).
+
+The check is conservative — it only flags the obvious tautologies.
+A clever caller can still smuggle T past us with (or t ...) or
+(:fragment \"1=1\"); the guard is a safety net for accidents,
+not a sandbox."
+  (or (eq expr t)
+      (and (consp expr)
+           (let ((op (and (symbolp (first expr))
+                          (string-upcase (symbol-name (first expr))))))
+             (and (equal op "=")
+                  (equal (second expr) (third expr)))))))
+
+(defun query-has-real-where-p (query)
+  "T when QUERY has at least one where clause that isn't a
+tautology. Used by the bulk mutation guards."
+  (and (query-wheres query)
+       (some (lambda (e) (not (tautological-where-p e)))
+             (query-wheres query))))
+
 (defun repo-update-all (repo query set-plist &key all)
   "Bulk UPDATE rows matching QUERY with SET-PLIST. Returns rows affected.
 
-A QUERY with no WHERE clause would update every row in the table; that
-is almost always a bug introduced by a missing WHERE-IF. Refuses unless
-ALL is non-nil — pass :ALL T to confirm you really mean every row."
-  (unless (or all (query-wheres query))
+A QUERY with no WHERE clause — or one whose only clauses are
+tautologies like (where q t) or (where q '(= 1 1)) — would update
+every row in the table. That's almost always a bug introduced by a
+missing WHERE-IF or a placeholder filter that never got replaced.
+Refuses unless ALL is non-nil — pass :ALL T to confirm you really
+mean every row."
+  (unless (or all (query-has-real-where-p query))
     (error "repo-update-all refuses to touch every row.~@
-            Add a WHERE or pass :all t."))
+            Add a non-tautological WHERE or pass :all t."))
   (multiple-value-bind (sql params)
       (update-sql (repo-adapter repo) (query-table query)
                   set-plist (query-where-expr query))
@@ -244,10 +295,10 @@ ALL is non-nil — pass :ALL T to confirm you really mean every row."
 
 (defun repo-delete-all (repo query &key all)
   "Bulk DELETE rows matching QUERY. Returns rows affected. See
-REPO-UPDATE-ALL for the no-WHERE safety guard."
-  (unless (or all (query-wheres query))
+REPO-UPDATE-ALL for the no-WHERE / tautology safety guard."
+  (unless (or all (query-has-real-where-p query))
     (error "repo-delete-all refuses to delete every row.~@
-            Add a WHERE or pass :all t."))
+            Add a non-tautological WHERE or pass :all t."))
   (multiple-value-bind (sql params)
       (delete-sql (repo-adapter repo) (query-table query)
                   (query-where-expr query))
@@ -394,6 +445,30 @@ condition also rolls back and is re-raised."
 ;;; --- escape hatch for raw SQL / migrations ---
 
 (defun repo-execute (repo sql &optional params)
+  "Run raw SQL with optional positional PARAMS.
+
+This is an UNPARAMETERISED ESCAPE HATCH — the SQL string is passed
+to the adapter unchanged. It's intended for DDL during demos and
+tests, one-off admin queries, and bootstrapping when an external
+migration tool isn't yet wired up.
+
+USE PARAMS FOR EVERY DYNAMIC VALUE. The first argument is fixed
+SQL; the second carries the values:
+
+  GOOD:
+    (repo-execute repo
+                  \"SELECT * FROM users WHERE id = ?\"
+                  (list user-id))
+
+  BAD (SQL injection):
+    (repo-execute repo
+                  (format nil \"SELECT * FROM users WHERE id = ~a\"
+                          user-id))
+
+There is no smart string parser between this function and the
+adapter — anything you concatenate into SQL is executed verbatim.
+Never thread user input into the SQL string itself; bind it via
+PARAMS."
   (let ((adapter (repo-adapter repo)))
     (with-telemetry (adapter sql params)
       (adapter-execute adapter sql params))))
