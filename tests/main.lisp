@@ -900,6 +900,44 @@
            (is (= 42 (getf (repo-get r 'cnt-row 1) :n))))
       (sqlite-close a))))
 
+(test update-set-keyword-binds-as-parameter
+  ;; Regression: a keyword RHS used to compile to a column reference
+  ;; (e.g. SET status = "active" would mean "set status to the value of
+  ;; column \"active\""). That's a real footgun for :enum casts whose
+  ;; values are keywords. After the fix, keywords are bound as
+  ;; parameters; explicit column-to-column copies must go through
+  ;; (:fragment "other_col").
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (st (clecto::make-sql-state :adapter a)))
+    (let ((rendered (clecto::compile-set-value st :active)))
+      ;; Should be a parameter placeholder ("?" for SQLite), not the
+      ;; quoted identifier "active".
+      (is (equal "?" rendered))
+      (is (equal '(:active) (clecto::sql-state-params st))))))
+
+(test update-set-keyword-enum-roundtrip
+  ;; End-to-end: enum values stored as keywords don't drift into being
+  ;; column references at UPDATE time.
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE st (id INTEGER PRIMARY KEY, status TEXT)")
+           (clecto:defschema st-row "st"
+             (:id     :integer :primary-key t)
+             (:status :enum :values '(:draft :active)))
+           (repo-insert r (cast 'st-row '(:status :draft) '(:status)))
+           (let ((cs (put-change
+                      (cast (list :__schema__ 'st-row :id 1) '() '())
+                      :status :active)))
+             (repo-update r cs))
+           ;; The stored value should be the string form of :ACTIVE
+           ;; (the SQLite encoder downcases keyword params), not
+           ;; whatever happens to live in some other column.
+           (is (equal "active"
+                      (string (getf (repo-get r 'st-row 1) :status)))))
+      (sqlite-close a))))
+
 ;;; --- bulk: insert-all / update-all / delete-all ---
 
 (defschema bulk-user "bulk_users"

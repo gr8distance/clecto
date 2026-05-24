@@ -82,24 +82,38 @@ share the same column set; column order is taken from the first row."
 
 (defun compile-set-value (st v)
   "Compile a value sitting on the right-hand side of an UPDATE SET pair.
-A keyword is treated as a column reference (so :col1 := :col2 works);
-a (:fragment ...) form expands to its raw-SQL body with safe parameter
-substitution (used by clauth's atomic increment); anything else is a
-parameter binding.
 
-NB: the boolean sentinels :TRUE and :FALSE (introduced by the
-schema-aware encoder in ENCODE-BOOLEANS) are routed through
-EMIT-PARAM so the adapter can render them as 0/1 / 't'/'f' — they
-must not get the generic 'keyword → column ref' treatment that would
-otherwise turn UPDATE flag = :FALSE into UPDATE flag = \"false\".
+A (:fragment ...) form expands to its raw-SQL body with safe parameter
+substitution (used by clauth's atomic increment). Anything else —
+including bare keywords — is treated as a parameter value.
 
-DEVELOPER-TRUST CONTRACT: :fragment templates and bare-keyword column
-refs are interpreted as raw SQL pieces. Never thread untrusted input
-into either side; the cast layer already coerces typed fields, but an
-untyped field accepting raw (put-change ...) input has no such guard."
+For an SQL-side column-to-column copy, write it as a fragment:
+    (list :name (list :fragment \"other_col\"))
+
+NOT as a bare keyword. Bare keywords used to compile to column
+references, which made it possible for a :enum cast result (e.g.
+the keyword :ACTIVE in (put-change cs :status :active)) to silently
+become a column reference in the generated SQL:
+
+    -- before this fix:
+    UPDATE users SET \"status\" = \"active\" WHERE \"id\" = ?
+    --                              ↑↑↑↑↑↑↑↑ column ref, not 'active'
+
+If the table happened to have an \"active\" column, this would copy
+that column's value into the status column. The risk surface was
+small in practice (caller-controlled cast pipeline), but the
+footgun was sharp.
+
+The boolean sentinels :TRUE / :FALSE (introduced by ENCODE-BOOLEANS)
+go through EMIT-PARAM so the adapter can render them as 0/1 / 't'/'f'."
   (cond
-    ((or (eq v :true) (eq v :false)) (emit-param st v))
-    (t (compile-operand st v))))
+    ((and (consp v) (eq (car v) :fragment))
+     (compile-fragment st v))
+    (t
+     ;; Bind every other value — including keywords (enum values, etc.) —
+     ;; as a parameter. Column-ref-as-SET-RHS is the fragment-only path
+     ;; now; explicit, auditable, no surprises.
+     (emit-param st v))))
 
 (defun update-sql (adapter table set-plist where-expr)
   "Compile an UPDATE statement. SET-PLIST values are run through
