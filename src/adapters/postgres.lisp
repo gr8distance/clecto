@@ -14,13 +14,19 @@
                :reader pg-conn-lock)))
 
 (defun make-postgres-adapter (database user password host
-                              &key (port 5432) (use-ssl :try) pooled-p)
+                              &key (port 5432) (use-ssl :yes) pooled-p)
   "Connect to a Postgres database via postmodern. POOLED-P uses
 postmodern's connection pool keyed by connection spec.
 
-USE-SSL defaults to :TRY (use TLS if the server supports it, otherwise
-plaintext). Pass :YES to require TLS or :NO to opt out — never opt out
-for connections that traverse anything but a Unix socket."
+USE-SSL defaults to :YES (require TLS — connection fails if the server
+won't negotiate it). This is the fail-secure default: postmodern's
+:TRY mode silently falls back to plaintext when a network MITM strips
+the TLS upgrade, which would leak credentials and row data over the
+wire.
+
+Pass :NO **only** for connections that never leave a trusted boundary
+— typically a Unix socket on the same host. Anything that traverses
+even a single switch needs :YES."
   (make-instance 'postgres-adapter
                  :connection (postmodern:connect database user password host
                                                  :port port
