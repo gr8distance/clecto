@@ -138,13 +138,33 @@ appending changes in front of data is enough."
           fields
           :initial-value cs))
 
-(defun validate-format (cs field substring &key (message "has invalid format"))
-  "Crude format check: SUBSTRING must appear in the field value.
-Sufficient for email-ish '@' checks without pulling in a regex lib."
+(defun validate-contains (cs field substring &key (message "is invalid"))
+  "Substring check: SUBSTRING must appear in the field's value.
+
+This is **not** a regex / format validator — it's a literal
+SEARCH-substring-in-string check. The name `validate-format` was
+inherited from Rails / Ecto where the equivalent is regex-backed;
+that name overpromises here and is being phased out (see
+VALIDATE-FORMAT below for the deprecated alias).
+
+For real email-shape validation, use clauth:valid-email-shape-p
+(Phoenix-equivalent regex). For everything else, write a
+custom validator — clecto stays free of cl-ppcre as a core
+dependency."
   (let ((v (get-field cs field)))
     (if (and (stringp v) (search substring v))
         cs
         (add-error cs field message))))
+
+(defun validate-format (cs field substring &key (message "has invalid format"))
+  "DEPRECATED: prefer VALIDATE-CONTAINS, which has the same shape
+but a name that matches what the check actually does (substring,
+not regex).
+
+Callers that genuinely need email-shape validation should switch to
+clauth:valid-email-shape-p — this never has been a real format
+check despite the name."
+  (validate-contains cs field substring :message message))
 
 (defun validate-number (cs field &key < <= > >= = (message "is out of range"))
   (let ((v (get-field cs field)))
