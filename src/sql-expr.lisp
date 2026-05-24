@@ -18,10 +18,15 @@
 (defun fragment-form-p (x)
   (and (consp x) (eq (car x) :fragment)))
 
-(defparameter *fragment-template-cap* 65536
+(defparameter *fragment-template-cap* 4096
   "Maximum length accepted for a fragment template. Fragment templates
-are by contract developer constants — a 64 KB cap catches accidental
-threading of unbounded input.")
+are by contract developer constants — real-world uses (atomic
+counters, lower(), coalesce(), JSON extracts) are all well under
+1 KB. A 4 KB cap is a generous backstop that still catches
+accidental threading of unbounded user input.
+
+Raise this only if a legitimate template genuinely needs to be
+larger; lowering it further (e.g. 1024) tightens the catch.")
 
 (defun compile-fragment (st form)
   "Expand (:fragment \"sql with ? holes\" arg1 arg2 ...) — each ? is
