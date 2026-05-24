@@ -915,6 +915,61 @@
       (is (equal "?" rendered))
       (is (equal '(:active) (clecto::sql-state-params st))))))
 
+(test repo-get-by-rejects-unknown-keys
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (clecto:defschema gb-user "gb_users"
+             (:id    :integer :primary-key t)
+             (:email :string))
+           (repo-execute r "CREATE TABLE gb_users (id INTEGER PRIMARY KEY, email TEXT)")
+           ;; Declared field works.
+           (is (null (repo-get-by r 'gb-user '(:email "x@y"))))
+           ;; Undeclared field signals — mass-assignment-style probe is
+           ;; blocked.
+           (signals error
+             (repo-get-by r 'gb-user '(:password-hash "guess")))
+           ;; :allowed-keys can narrow further than the schema's declared
+           ;; fields.
+           (signals error
+             (repo-get-by r 'gb-user '(:email "x@y")
+                          :allowed-keys '(:id))))
+      (sqlite-close a))))
+
+(test repo-update-all-rejects-tautology
+  (let* ((a (make-sqlite-adapter ":memory:"))
+         (r (make-repo a)))
+    (unwind-protect
+         (progn
+           (repo-execute r "CREATE TABLE taut (id INTEGER, n INTEGER)")
+           ;; Bare T -> tautology, refused.
+           (signals error
+             (repo-update-all r (where (from :taut) t) '(:n 1)))
+           ;; (= 1 1) -> tautology, refused.
+           (signals error
+             (repo-update-all r (where (from :taut) '(= 1 1)) '(:n 1)))
+           ;; (= 2 2) too.
+           (signals error
+             (repo-delete-all r (where (from :taut) '(= 2 2))))
+           ;; :all t bypasses.
+           (repo-update-all r (where (from :taut) t) '(:n 1) :all t)
+           ;; Real filter passes guard.
+           (repo-update-all r (where (from :taut) '(= :id 99)) '(:n 1)))
+      (sqlite-close a))))
+
+(test db-error-sql-can-be-suppressed
+  (let ((e (make-condition 'clecto:db-error :sql "SELECT * FROM secrets")))
+    ;; Default: SQL appears in the report (dev-friendly).
+    (let ((clecto:*db-error-include-sql* t))
+      (is (search "SELECT" (princ-to-string e))))
+    ;; Suppressed: production renderer doesn't leak table names via
+    ;; the default reporter.
+    (let ((clecto:*db-error-include-sql* nil))
+      (is (not (search "SELECT" (princ-to-string e))))
+      ;; Slot still accessible for code that *wants* to log it.
+      (is (equal "SELECT * FROM secrets" (clecto:db-error-sql e))))))
+
 (test update-set-keyword-enum-roundtrip
   ;; End-to-end: enum values stored as keywords don't drift into being
   ;; column references at UPDATE time.

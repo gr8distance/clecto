@@ -22,7 +22,8 @@
    #:cs-constraints #:cs-action
    #:cast #:put-change #:get-change #:get-field
    #:add-error #:apply-changes
-   #:validate-required #:validate-format #:validate-number #:validate-length
+   #:validate-required #:validate-contains #:validate-format
+   #:validate-number #:validate-length
    #:validate-inclusion #:validate-exclusion #:validate-subset
    #:validate-confirmation #:validate-acceptance
    #:traverse-errors #:apply-action
@@ -48,7 +49,8 @@
    #:adapter-supports-returning-p
    #:adapter-begin #:adapter-commit #:adapter-rollback
    #:adapter-translate-constraint-error
-   #:db-error #:db-error-original #:db-error-sql)
+   #:db-error #:db-error-original #:db-error-sql
+   #:*db-error-include-sql*)
 
   ;; --- sql ---
   (:export #:to-sql)

@@ -113,18 +113,34 @@ this to choose between RETURNING and a last-insert-id roundtrip.")
    "Signaled to abort a repo-transaction. The transaction body sees no
 condition; any returned value is discarded and the txn is rolled back."))
 
+(defparameter *db-error-include-sql* t
+  "Controls whether the DB-ERROR default reporter includes the offending
+SQL string. Defaults to T (helpful in development; the SQL pinpoints
+which query blew up). Set to NIL in production environments where the
+SQL string itself is sensitive — table / column names of internal
+audit tables, schema layout, etc.
+
+The :sql slot is still preserved on the condition either way — only
+the default report's textual output is affected. A custom error
+renderer can choose to read DB-ERROR-SQL or not.")
+
 (define-condition db-error (error)
   ((original :initarg :original :reader db-error-original)
    (sql      :initarg :sql      :initform nil :reader db-error-sql))
   (:report (lambda (c stream)
              (format stream "Database error.~@[ SQL: ~a~]"
-                     (db-error-sql c))))
+                     (and *db-error-include-sql* (db-error-sql c)))))
   (:documentation
    "Generic wrapper raised when the underlying adapter signals a DB error
 that no declared constraint matched. The original condition is preserved
 under DB-ERROR-ORIGINAL — but its (potentially row-leaking) message is
 NOT printed by the default reporter, so it stays out of error pages and
-logs unless explicitly extracted."))
+logs unless explicitly extracted.
+
+The SQL string that triggered the failure is preserved on DB-ERROR-SQL
+and printed by the default reporter when *DB-ERROR-INCLUDE-SQL* is
+non-NIL (the development-friendly default). Bind it to NIL in
+production to keep table / column names out of generic 500 responses."))
 
 (defgeneric adapter-translate-constraint-error (adapter condition constraints)
   (:documentation
